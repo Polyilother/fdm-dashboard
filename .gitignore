@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Environment and password files
+.env
+*.env
+postgres_password.txt
+*.key
+*.pem
+
+# Local databases and migrated legacy data
+*.db
+*.sqlite
+*.sqlite3
+fdm_tasks.db
+fdm_tasks.json
+
+# Database backups and exported production data
+backups/
+*.backup
+*.dump
+*.sql
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.old
+~$*
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
