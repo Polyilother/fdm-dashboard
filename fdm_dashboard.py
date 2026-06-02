@@ -804,9 +804,26 @@ def active_attention_tasks(tasks):
             items.append(task)
     return items
 
+def truthy_db_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+def normalize_user_row(row):
+    if not row:
+        return None
+    user = dict(row)
+    user["is_admin"] = truthy_db_value(user.get("is_admin"))
+    user["active"] = truthy_db_value(user.get("active"))
+    return user
+
 def get_user(username):
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return normalize_user_row(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
 
 def create_login_session(username):
     token = secrets.token_urlsafe(32)
@@ -840,7 +857,11 @@ def get_session_token_from_url():
 
 def list_users():
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM users ORDER BY is_admin DESC, username").fetchall()
+        rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    return sorted(
+        [normalize_user_row(row) for row in rows],
+        key=lambda user: (not user["is_admin"], user["username"]),
+    )
 
 def create_user(username, password, permissions):
     with get_conn() as conn:
@@ -886,20 +907,11 @@ def current_user():
         return user
     token = get_session_token_from_url()
     user = user_from_session_token(token)
-    if user and user["active"]:
+    if is_active_user(user):
         st.session_state["auth_user"] = user["username"]
         st.session_state["_current_user_row"] = dict(user)
         return st.session_state["_current_user_row"]
     return None
-
-def truthy_db_value(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def is_admin_user(user):
     return bool(user) and truthy_db_value(user.get("is_admin"))
