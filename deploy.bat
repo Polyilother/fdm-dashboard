@@ -39,7 +39,7 @@ if errorlevel 1 (
 
 echo [5/5] Start FDM dashboard...
 if "%FDM_PGHOST%"=="" set FDM_PGHOST=localhost
-if "%FDM_PGPORT%"=="" set FDM_PGPORT=5432
+if "%FDM_PGPORT%"=="" set FDM_PGPORT=2926
 if "%FDM_PGDATABASE%"=="" set FDM_PGDATABASE=fdm_dashboard
 if "%FDM_PGUSER%"=="" set FDM_PGUSER=postgres
 if "%FDM_PGPASSWORD%"=="" set /p FDM_PGPASSWORD=Enter PostgreSQL password:

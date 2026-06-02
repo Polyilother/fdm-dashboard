@@ -892,10 +892,25 @@ def current_user():
         return st.session_state["_current_user_row"]
     return None
 
+def truthy_db_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+def is_admin_user(user):
+    return bool(user) and truthy_db_value(user.get("is_admin"))
+
+def is_active_user(user):
+    return bool(user) and truthy_db_value(user.get("active"))
+
 def user_permissions(user):
     if not user:
         return set()
-    if user["is_admin"]:
+    if is_admin_user(user):
         return set(PERMISSIONS.keys())
     try:
         return set(json.loads(user["permissions"] or "[]"))
@@ -910,7 +925,7 @@ def request_view_refresh():
 
 def login_gate():
     user = current_user()
-    if user and user["active"]:
+    if is_active_user(user):
         return user
     st.title("FDM 打印室任务看板")
     st.markdown("### 用户登录")
@@ -918,7 +933,7 @@ def login_gate():
     password = st.text_input("密码", type="password")
     if st.button("登录", type="primary"):
         row = get_user(username.strip())
-        if row and row["active"] and verify_password(password, row["password_hash"]):
+        if is_active_user(row) and verify_password(password, row["password_hash"]):
             st.session_state["auth_user"] = row["username"]
             st.query_params["session"] = create_login_session(row["username"])
             request_view_refresh()
@@ -929,7 +944,7 @@ def login_gate():
 
 def render_user_management_panel():
     user = current_user()
-    if not user or not user["is_admin"]:
+    if not is_admin_user(user):
         return
     with st.container(border=True):
         st.markdown("### 👤 用户管理")
@@ -957,7 +972,7 @@ def render_user_management_panel():
                         st.error("用户名已存在。")
 
         with tab_manage:
-            normal_users = [u for u in list_users() if not u["is_admin"]]
+            normal_users = [u for u in list_users() if not is_admin_user(u)]
             if normal_users:
                 user_rows = []
                 for u in normal_users:
@@ -1180,7 +1195,7 @@ with st.sidebar:
         st.query_params.clear()
         request_view_refresh()
     page_options = ["电子看板"]
-    if auth_user['is_admin']:
+    if is_admin_user(auth_user):
         page_options.append("后台管理")
     elif any(can(p) for p in ['report_task_flow', 'report_maintenance', 'report_oee', 'report_efficiency']):
         page_options.append("报表中心")
@@ -1351,7 +1366,7 @@ with st.sidebar:
             st.info("当前账号无设备状态修改权限。")
         st.divider()
     
-        if current_user()["is_admin"]:
+        if is_admin_user(current_user()):
             with st.popover("🚨 清除所有记录", use_container_width=True):
                 pwd = st.text_input("管理员密码", type="password")
                 if st.button("确认清空"):

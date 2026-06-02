@@ -1,9 +1,13 @@
 @echo off
 cd /d "%~dp0"
-set FDM_PGHOST=localhost
-set FDM_PGPORT=5432
-set FDM_PGDATABASE=fdm_dashboard
-set FDM_PGUSER=postgres
+if "%FDM_PGHOST%"=="" set FDM_PGHOST=localhost
+if "%FDM_PGPORT%"=="" set FDM_PGPORT=2926
+if "%FDM_PGDATABASE%"=="" set FDM_PGDATABASE=fdm_dashboard
+if "%FDM_PGUSER%"=="" set FDM_PGUSER=postgres
 if "%FDM_PGPASSWORD%"=="" set /p FDM_PGPASSWORD=Enter PostgreSQL password:
-"C:\Users\Administrator\AppData\Local\Programs\Python\Python314\python.exe" -m streamlit run fdm_dashboard.py --server.address 0.0.0.0 --server.port 8502
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -m streamlit run fdm_dashboard.py --server.address 0.0.0.0 --server.port 8502
+) else (
+    python -m streamlit run fdm_dashboard.py --server.address 0.0.0.0 --server.port 8502
+)
 pause
