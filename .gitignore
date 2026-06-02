@@ -33,6 +33,7 @@ backups/
 *.sql
 
 # Logs and temporary files
+logs/
 *.log
 *.tmp
 *.bak
@@ -44,4 +45,3 @@ backups/
 Thumbs.db
 .idea/
 .vscode/
-
