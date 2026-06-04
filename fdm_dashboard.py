@@ -9,6 +9,7 @@ import zipfile
 import io
 from datetime import datetime, timedelta
 from pathlib import Path
+import streamlit.components.v1 as components
 
 try:
     import psycopg2
@@ -256,6 +257,8 @@ def normalize_task(t):
         t["batch_end_times"].extend(["-"] * (t["total_batches"] - len(t["batch_end_times"])))
     t.setdefault("material", "未知")
     t.setdefault("special_notes", "无")
+    t.setdefault("pending_special_notes", t.get("special_notes", "无"))
+    t.setdefault("printing_special_notes", t.get("special_notes", "无"))
     t.setdefault("exception_log", "-")
     t.setdefault("transfer_notes", "-")
     t.setdefault("operator", "-")
@@ -795,12 +798,29 @@ def list_daily_logs(log_date=None):
             (log_date or get_today_key(),),
         ).fetchall()
 
-def active_attention_tasks(tasks):
+def get_task_attention_note(task):
+    status = task.get("status")
+    if status == "待上机":
+        note = task.get("pending_special_notes", task.get("special_notes", "无"))
+    elif status == "打印中":
+        note = task.get("printing_special_notes", task.get("special_notes", "无"))
+    else:
+        note = "无"
+    note = str(note or "").strip()
+    return note if note else "无"
+
+def has_attention_note(note):
+    return str(note or "").strip() not in ["", "无", "-", "空白"]
+
+def active_attention_tasks(tasks, target_status=None):
     active_statuses = {"待上机", "打印中"}
     items = []
     for task in tasks:
-        note = str(task.get("special_notes", "") or "").strip()
-        if task.get("status") in active_statuses and note and note not in ["无", "-", "空白"]:
+        status = task.get("status")
+        if target_status and status != target_status:
+            continue
+        note = get_task_attention_note(task)
+        if status in active_statuses and has_attention_note(note):
             items.append(task)
     return items
 
@@ -1276,7 +1296,8 @@ with st.sidebar:
                             for row in preview_rows:
                                 st.caption(row)
             
-                    special_notes = st.text_area("注意事项", key=f"form_notes_{v}")
+                    pending_special_notes = st.text_area("待上机注意事项", key=f"form_pending_notes_{v}")
+                    printing_special_notes = st.text_area("打印中注意事项", key=f"form_printing_notes_{v}")
             
                     if st.button("🚀 发送任务", use_container_width=True, type="primary", key=f"submit_btn_{v}", disabled=bool(occupied_task)):
                         final_eng = login_engineer
@@ -1316,7 +1337,9 @@ with st.sidebar:
                                 "status": "待上机",
                                 "start_time": "-", "operator": "-", "end_operator": "-", "end_time": "-",
                                 "eta_time": "-",
-                                "special_notes": special_notes,
+                                "special_notes": pending_special_notes,
+                                "pending_special_notes": pending_special_notes,
+                                "printing_special_notes": printing_special_notes,
                                 "exception_log": "-", "transfer_notes": "-",
                                 "created_at": current_time
                             })
@@ -1589,6 +1612,178 @@ st.markdown("""
         color: #FFFFFF !important;
         font-weight: 900 !important;
     }
+    div[data-testid="stMarkdownContainer"] a.quick-back-top[href^="#"] {
+        position: fixed !important;
+        right: 22px !important;
+        bottom: 24px !important;
+        z-index: 2147483647 !important;
+        width: 42px !important;
+        height: 42px !important;
+        border-radius: 50% !important;
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        background: #1F2937 !important;
+        color: #FFFFFF !important;
+        border: 1px solid rgba(255, 255, 255, 0.35) !important;
+        box-shadow: 0 8px 22px rgba(31, 41, 55, 0.24) !important;
+        font-size: 23px !important;
+        font-weight: 900 !important;
+        line-height: 1 !important;
+        text-decoration: none !important;
+        cursor: pointer !important;
+        user-select: none !important;
+    }
+    div[data-testid="stMarkdownContainer"] a.quick-back-top[href^="#"]:hover {
+        background: #111827 !important;
+        color: #FFFFFF !important;
+        text-decoration: none !important;
+        box-shadow: 0 10px 26px rgba(31, 41, 55, 0.32) !important;
+    }
+    div[data-testid="stMarkdownContainer"] a.quick-back-top[href^="#"]:active {
+        transform: translateY(1px) !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] a[href^="#"] {
+        position: fixed !important;
+        right: 22px !important;
+        bottom: 24px !important;
+        z-index: 2147483647 !important;
+        width: 42px !important;
+        height: 42px !important;
+        min-width: 42px !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        background: #1F2937 !important;
+        color: #FFFFFF !important;
+        border: 1px solid rgba(255, 255, 255, 0.35) !important;
+        box-shadow: 0 8px 22px rgba(31, 41, 55, 0.24) !important;
+        font-size: 23px !important;
+        font-weight: 900 !important;
+        line-height: 1 !important;
+        text-decoration: none !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] a[href^="#"]:hover {
+        background: #111827 !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 10px 26px rgba(31, 41, 55, 0.32) !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] button {
+        position: fixed !important;
+        right: 22px !important;
+        bottom: 24px !important;
+        z-index: 2147483647 !important;
+        width: 42px !important;
+        height: 42px !important;
+        min-width: 42px !important;
+        min-height: 42px !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        background: #1F2937 !important;
+        color: #FFFFFF !important;
+        border: 1px solid rgba(255, 255, 255, 0.35) !important;
+        box-shadow: 0 8px 22px rgba(31, 41, 55, 0.24) !important;
+        font-size: 23px !important;
+        font-weight: 900 !important;
+        line-height: 1 !important;
+    }
+    div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] button:hover {
+        background: #111827 !important;
+        color: #FFFFFF !important;
+        border-color: rgba(255, 255, 255, 0.45) !important;
+        box-shadow: 0 10px 26px rgba(31, 41, 55, 0.32) !important;
+    }
+    div[data-testid="stMarkdownContainer"] button.quick-back-top {
+        position: fixed !important;
+        right: 22px !important;
+        bottom: 24px !important;
+        z-index: 2147483647 !important;
+        width: 42px !important;
+        height: 42px !important;
+        min-width: 42px !important;
+        min-height: 42px !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        background: #1F2937 !important;
+        color: #FFFFFF !important;
+        border: 1px solid rgba(255, 255, 255, 0.35) !important;
+        box-shadow: 0 8px 22px rgba(31, 41, 55, 0.24) !important;
+        font-size: 23px !important;
+        font-weight: 900 !important;
+        line-height: 1 !important;
+        cursor: pointer !important;
+        user-select: none !important;
+    }
+    div[data-testid="stMarkdownContainer"] button.quick-back-top:hover {
+        background: #111827 !important;
+        color: #FFFFFF !important;
+        border-color: rgba(255, 255, 255, 0.45) !important;
+        box-shadow: 0 10px 26px rgba(31, 41, 55, 0.32) !important;
+    }
+    div[data-testid="stMarkdownContainer"] button.quick-back-top:active {
+        transform: translateY(1px) !important;
+    }
+    @media (max-width: 768px) {
+        div[data-testid="stMarkdownContainer"] a.quick-back-top[href^="#"] {
+            right: 14px !important;
+            bottom: 16px !important;
+            width: 40px !important;
+            height: 40px !important;
+        }
+        div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] a[href^="#"] {
+            right: 14px !important;
+            bottom: 16px !important;
+            width: 40px !important;
+            height: 40px !important;
+            min-width: 40px !important;
+        }
+        div[data-testid="stElementContainer"]:has(#quick-back-top-marker) + div[data-testid="stElementContainer"] button {
+            right: 14px !important;
+            bottom: 16px !important;
+            width: 40px !important;
+            height: 40px !important;
+            min-width: 40px !important;
+            min-height: 40px !important;
+        }
+        div[data-testid="stMarkdownContainer"] button.quick-back-top {
+            right: 14px !important;
+            bottom: 16px !important;
+            width: 40px !important;
+            height: 40px !important;
+            min-width: 40px !important;
+            min-height: 40px !important;
+        }
+    }
     </style>
 """, unsafe_allow_html=True)
 if app_page == "后台管理":
@@ -1611,6 +1806,98 @@ if app_page == "报表中心":
     st.stop()
 
 st.markdown(
+    "<div id='dashboard-top'></div><span id='quick-back-top-marker'></span>",
+    unsafe_allow_html=True,
+)
+components.html(
+    """
+    <script>
+    (function () {
+        const doc = window.parent.document;
+        const oldButton = doc.getElementById("fdm-back-top-button");
+        if (oldButton) oldButton.remove();
+
+        const styleId = "fdm-back-top-style";
+        if (!doc.getElementById(styleId)) {
+            const style = doc.createElement("style");
+            style.id = styleId;
+            style.textContent = `
+                #fdm-back-top-button {
+                    position: fixed;
+                    right: 22px;
+                    bottom: 24px;
+                    z-index: 2147483647;
+                    width: 42px;
+                    height: 42px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    background: #1F2937;
+                    color: #FFFFFF;
+                    border: 1px solid rgba(255, 255, 255, 0.35);
+                    box-shadow: 0 8px 22px rgba(31, 41, 55, 0.24);
+                    font-size: 23px;
+                    font-weight: 900;
+                    line-height: 1;
+                    cursor: pointer;
+                    user-select: none;
+                    padding: 0;
+                }
+                #fdm-back-top-button:hover {
+                    background: #111827;
+                    box-shadow: 0 10px 26px rgba(31, 41, 55, 0.32);
+                }
+                #fdm-back-top-button:active {
+                    transform: translateY(1px);
+                }
+                @media (max-width: 768px) {
+                    #fdm-back-top-button {
+                        right: 14px;
+                        bottom: 16px;
+                        width: 40px;
+                        height: 40px;
+                    }
+                }
+            `;
+            doc.head.appendChild(style);
+        }
+
+        const button = doc.createElement("button");
+        button.id = "fdm-back-top-button";
+        button.type = "button";
+        button.title = "返回顶部";
+        button.setAttribute("aria-label", "返回顶部");
+        button.textContent = "↑";
+        button.onclick = function () {
+            const scrollTargets = [
+                window.parent,
+                doc.defaultView,
+                doc.documentElement,
+                doc.body,
+                doc.querySelector("section.main"),
+                doc.querySelector('[data-testid="stAppViewContainer"]'),
+                doc.querySelector('[data-testid="stAppViewBlockContainer"]'),
+                doc.querySelector(".stApp")
+            ];
+            scrollTargets.forEach(function (target) {
+                if (!target) return;
+                if (typeof target.scrollTo === "function") {
+                    try { target.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) { target.scrollTo(0, 0); }
+                }
+                if ("scrollTop" in target) target.scrollTop = 0;
+            });
+            const topMarker = doc.getElementById("dashboard-top");
+            if (topMarker) topMarker.scrollIntoView({ behavior: "smooth", block: "start" });
+        };
+        doc.body.appendChild(button);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
+st.markdown(
     "<div class='app-title'><span class='app-title-icon'>🖨️</span><span class='app-title-text'>FDM 打印室任务执行电子看板</span></div>",
     unsafe_allow_html=True,
 )
@@ -1621,22 +1908,34 @@ status_special_tasks = [t for t in all_tasks if t.get("status") in SPECIAL_STATU
 status_active_devices = status_printing_tasks + status_special_tasks
 
 with st.expander(f"🗒️ {get_today_key()} 日志", expanded=False):
-    attention_tasks = active_attention_tasks(all_tasks)
-    if attention_tasks:
-        for task in attention_tasks:
-            st.markdown(f"""
-            <div style="border-left:4px solid #EF4444; background:#FEF2F2; padding:8px 10px; margin-bottom:6px; border-radius:4px;">
-                <div style="font-size:12px; color:#374151;">
-                    <b>设备:</b> {task.get('machine_id', '-')} ｜ 
-                    <b>测试牌号:</b> {task.get('material', '-')} ｜ 
-                    <b>测试工程师:</b> {task.get('engineer', '-')} ｜ 
-                    <b>状态:</b> {task.get('status', '-')}
+    pending_attention_tasks = active_attention_tasks(all_tasks, "待上机")
+    printing_attention_tasks = active_attention_tasks(all_tasks, "打印中")
+
+    def render_attention_group(title, tasks, empty_text):
+        st.markdown(
+            f"<div style='font-size:13px; font-weight:900; color:#374151; margin:4px 0 8px 0;'>{title}</div>",
+            unsafe_allow_html=True,
+        )
+        if tasks:
+            for task in tasks:
+                note = get_task_attention_note(task)
+                st.markdown(f"""
+                <div style="border-left:4px solid #EF4444; background:#FEF2F2; padding:8px 10px; margin-bottom:6px; border-radius:4px;">
+                    <div style="font-size:12px; color:#374151;">
+                        <b>设备:</b> {task.get('machine_id', '-')} ｜ 
+                        <b>测试牌号:</b> {task.get('material', '-')} ｜ 
+                        <b>测试工程师:</b> {task.get('engineer', '-')} ｜ 
+                        <b>状态:</b> {task.get('status', '-')}
+                    </div>
+                    <div style="font-size:14px; font-weight:800; color:#991B1B; margin-top:3px;">{note}</div>
                 </div>
-                <div style="font-size:14px; font-weight:800; color:#991B1B; margin-top:3px;">{task.get('special_notes')}</div>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.caption("当前没有未下机任务的注意事项。")
+                """, unsafe_allow_html=True)
+        else:
+            st.caption(empty_text)
+
+    render_attention_group("⏳ 待上机注意事项", pending_attention_tasks, "当前没有待上机任务的注意事项。")
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    render_attention_group("🖨️ 打印中注意事项", printing_attention_tasks, "当前没有打印中任务的注意事项。")
 
 st.markdown("### 🔍 设备快速筛选")
 search_query = normalize_machine_id(st.text_input(
@@ -1836,8 +2135,7 @@ def render_task_card(task, is_printing):
         else:
             st.markdown(f"⏱️ 切片理论总耗时: <span style='color:#1E40AF; font-weight:bold;'>{theory_hours} 小时</span>", unsafe_allow_html=True)
     
-        notes = task.get('special_notes', '无')
-        clean_notes = notes.strip() if notes else "无"
+        clean_notes = get_task_attention_note(task)
     
         if is_printing:
             st.markdown(f"🏁 实际上机时间: {task.get('start_time')}")
@@ -1850,9 +2148,9 @@ def render_task_card(task, is_printing):
                 )
         
             if not clean_notes or clean_notes in ["无", "-", "空白"]:
-                st.markdown(f"📝 注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
+                st.markdown(f"📝 打印中注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
             else:
-                st.markdown(f"📝 注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
+                st.markdown(f"📝 打印中注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
         
             task.setdefault("batch_statuses", ["待打印"] * task["total_batches"])
             task.setdefault("batch_start_times", ["-"] * task["total_batches"])
@@ -2046,9 +2344,9 @@ def render_task_card(task, is_printing):
                       
         else:
             if not clean_notes or clean_notes in ["无", "-", "空白"]:
-                st.markdown(f"📝 注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
+                st.markdown(f"📝 待上机注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
             else:
-                st.markdown(f"📝 注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
+                st.markdown(f"📝 待上机注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
             
             st.write(f"派单时间: {task.get('created_at', '-')}")
             op_name = current_user()["username"]
