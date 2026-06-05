@@ -1,10 +1,13 @@
 import streamlit as st
 import pandas as pd
 import json
+import html
 import hashlib
 import secrets
 import os
 import re
+import shutil
+import subprocess
 import zipfile
 import io
 from datetime import datetime, timedelta
@@ -584,15 +587,28 @@ def init_database():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS batch_reprint_logs (
+                id SERIAL PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                machine_id TEXT,
+                batch_index INTEGER NOT NULL,
+                file_name TEXT,
+                reason TEXT NOT NULL,
+                operator TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
 
 def get_database_snapshot():
-    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs"]
+    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs", "batch_reprint_logs"]
     order_by_map = {
         "tasks": "created_at, id",
         "users": "id",
         "login_sessions": "created_at, token",
         "daily_logs": "id",
         "operation_logs": "id",
+        "batch_reprint_logs": "id",
     }
     snapshot = {
         "created_at": get_formatted_time(),
@@ -609,18 +625,61 @@ def get_database_snapshot():
 def write_database_snapshot(path):
     Path(path).write_text(get_database_snapshot(), encoding="utf-8")
 
+def find_pg_dump_executable():
+    pg_dump = shutil.which("pg_dump")
+    if pg_dump:
+        return pg_dump
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    postgres_root = os.path.join(program_files, "PostgreSQL")
+    if os.path.isdir(postgres_root):
+        versions = []
+        for name in os.listdir(postgres_root):
+            bin_path = os.path.join(postgres_root, name, "bin", "pg_dump.exe")
+            if os.path.exists(bin_path):
+                versions.append((name, bin_path))
+        if versions:
+            return sorted(versions, reverse=True)[0][1]
+    return None
+
+def run_pg_dump_backup(backup_file):
+    pg_dump = find_pg_dump_executable()
+    if not pg_dump:
+        return False, "未找到 pg_dump.exe，请确认服务器已安装 PostgreSQL，并包含 bin 目录。"
+    env = os.environ.copy()
+    env["PGPASSWORD"] = PGPASSWORD
+    cmd = [
+        pg_dump,
+        "-h", str(PGHOST),
+        "-p", str(PGPORT),
+        "-U", str(PGUSER),
+        "-d", str(PGDATABASE),
+        "-F", "c",
+        "-f", backup_file,
+    ]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        if os.path.exists(backup_file):
+            try:
+                os.remove(backup_file)
+            except OSError:
+                pass
+        return False, (result.stderr or result.stdout or "pg_dump 备份失败").strip()
+    return True, ""
+
 def backup_database_once_daily():
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    backup_file = os.path.join(BACKUP_DIR, f"fdm_postgresql_{datetime.now().strftime('%Y%m%d')}.json")
+    backup_file = os.path.join(BACKUP_DIR, f"fdm_postgresql_{datetime.now().strftime('%Y%m%d')}.dump")
     if not os.path.exists(backup_file):
-        write_database_snapshot(backup_file)
+        run_pg_dump_backup(backup_file)
 
 def create_manual_backup():
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    backup_file = os.path.join(BACKUP_DIR, f"fdm_postgresql_manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    write_database_snapshot(backup_file)
-    log_operation("手动备份数据库", detail=f"备份文件:{os.path.basename(backup_file)}")
-    return backup_file
+    backup_file = os.path.join(BACKUP_DIR, f"fdm_postgresql_manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dump")
+    ok, error = run_pg_dump_backup(backup_file)
+    if ok:
+        log_operation("手动备份数据库", detail=f"pg_dump备份文件:{os.path.basename(backup_file)}")
+        return backup_file, ""
+    return None, error
 
 def get_latest_backup_info():
     if not os.path.exists(BACKUP_DIR):
@@ -628,7 +687,7 @@ def get_latest_backup_info():
     backups = [
         os.path.join(BACKUP_DIR, name)
         for name in os.listdir(BACKUP_DIR)
-        if name.lower().endswith(".json") and name.startswith("fdm_postgresql")
+        if name.lower().endswith((".dump", ".backup")) and name.startswith("fdm_postgresql")
     ]
     if not backups:
         return None
@@ -676,7 +735,7 @@ def get_database_health():
         last_log = conn.execute("SELECT action, operator, created_at FROM operation_logs ORDER BY id DESC LIMIT 1").fetchone()
         db_size = conn.execute("SELECT pg_database_size(current_database()) AS size_bytes").fetchone()["size_bytes"]
     today_key = datetime.now().strftime("%Y%m%d")
-    today_backup_ok = os.path.exists(os.path.join(BACKUP_DIR, f"fdm_postgresql_{today_key}.json"))
+    today_backup_ok = os.path.exists(os.path.join(BACKUP_DIR, f"fdm_postgresql_{today_key}.dump"))
     return {
         "db_path": DB_LABEL,
         "backup_dir": BACKUP_DIR,
@@ -971,7 +1030,6 @@ def login_gate():
             request_view_refresh()
         else:
             st.error("用户名或密码错误，或账号已停用。")
-    st.info("首次默认管理员：admin / admin123。上线前请新增正式账号，并妥善保管管理员密码。")
     st.stop()
 
 def render_user_management_panel():
@@ -1080,11 +1138,11 @@ def render_admin_data_tools():
         st.divider()
 
         if st.button("立即备份数据库", use_container_width=True, key="btn_manual_db_backup"):
-            backup_file = create_manual_backup()
+            backup_file, backup_error = create_manual_backup()
             if backup_file:
                 st.success(f"已备份：{os.path.basename(backup_file)}")
             else:
-                st.error("数据库文件不存在，备份失败。")
+                st.error(f"备份失败：{backup_error}")
         snapshot_bytes = get_database_snapshot().encode("utf-8")
         st.download_button(
             "下载当前数据库快照",
@@ -1144,6 +1202,76 @@ def update_task_field_log(tid, field, value, action):
             (action, str(tid), str(task.get("machine_id", "")), st.session_state.get("auth_user", ""), value, get_formatted_time()),
         )
 
+
+def append_exception_log_text(task, entry):
+    current = str(task.get("exception_log", "") or "").strip()
+    if not current or current == "-":
+        task["exception_log"] = entry
+    else:
+        task["exception_log"] = f"{current}；{entry}"
+
+
+def list_batch_reprint_logs_for_task(tid, limit=10):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT batch_index, file_name, reason, operator, created_at
+            FROM batch_reprint_logs
+            WHERE task_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (str(tid), int(limit)),
+        ).fetchall()
+
+
+def reset_completed_batch_for_reprint(tid, idx, raw_file_name, reason):
+    reason = str(reason or "").strip()
+    if not reason:
+        st.session_state[f"reprint_err_{tid}_{idx}"] = "请填写重新打印原因。"
+        return
+    with get_conn() as conn:
+        row = conn.execute("SELECT data FROM tasks WHERE id = ? FOR UPDATE", (str(tid),)).fetchone()
+        if not row:
+            return
+        task = normalize_task(json.loads(row["data"]))
+        if idx < 0 or idx >= len(task["batch_statuses"]):
+            return
+        if task["batch_statuses"][idx] != "已完成":
+            return
+        now = get_formatted_time()
+        task["batch_statuses"][idx] = "待打印"
+        task["batch_start_times"][idx] = "-"
+        task["batch_end_times"][idx] = "-"
+        conn.execute(
+            "UPDATE tasks SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(task, ensure_ascii=False), now, str(tid)),
+        )
+        conn.execute(
+            """
+            INSERT INTO batch_reprint_logs
+                (task_id, machine_id, batch_index, file_name, reason, operator, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(tid),
+                str(task.get("machine_id", "")),
+                int(idx) + 1,
+                raw_file_name,
+                reason,
+                st.session_state.get("auth_user", ""),
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO operation_logs (action, task_id, machine_id, operator, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("批次重新打印", str(tid), str(task.get("machine_id", "")), st.session_state.get("auth_user", ""), f"盘{idx+1}:{raw_file_name}; 原因:{reason}", now),
+        )
+    st.session_state.pop(f"reprint_reason_{tid}_{idx}", None)
+    st.session_state.pop(f"reprint_confirm_{tid}_{idx}", None)
+    st.session_state.pop(f"reprint_err_{tid}_{idx}", None)
+
+
 def toggle_batch_status(tid, idx, raw_file_name):
     with get_conn() as conn:
         row = conn.execute("SELECT data FROM tasks WHERE id = ? FOR UPDATE", (str(tid),)).fetchone()
@@ -1169,10 +1297,8 @@ def toggle_batch_status(tid, idx, raw_file_name):
             task.setdefault("finished_batch_timestamps", []).append(f"盘{idx+1}:{now}")
             action = "批次完工"
         elif task["batch_statuses"][idx] == "已完成":
-            task["batch_statuses"][idx] = "待打印"
-            task["batch_start_times"][idx] = "-"
-            task["batch_end_times"][idx] = "-"
-            action = "批次重置"
+            st.session_state[f"reprint_confirm_{tid}_{idx}"] = True
+            return
         else:
             return
         st.session_state.pop(alert_key, None)
@@ -1611,6 +1737,14 @@ st.markdown("""
         border-color: #FF4B4B !important;
         color: #FFFFFF !important;
         font-weight: 900 !important;
+    }
+    span.batch-muted + div button,
+    div[data-testid="stElementContainer"]:has(> div span.batch-muted) + div[data-testid="stElementContainer"] button {
+        background: #F9FAFB !important;
+        border-color: #E5E7EB !important;
+        color: #9CA3AF !important;
+        opacity: 0.72 !important;
+        font-weight: 700 !important;
     }
     div[data-testid="stMarkdownContainer"] a.quick-back-top[href^="#"] {
         position: fixed !important;
@@ -2168,6 +2302,30 @@ def render_task_card(task, is_printing):
             tr_notes = task.get("transfer_notes", "-")
             if tr_notes and tr_notes != "-":
                 st.markdown(f"**班次交接记录:** <span style='color:#2563EB; font-weight:bold;'>{tr_notes}</span>", unsafe_allow_html=True)
+
+            reprint_logs = list_batch_reprint_logs_for_task(tid)
+            if reprint_logs:
+                reprint_items = []
+                for log in reprint_logs:
+                    created_at = html.escape(str(log.get("created_at", "-")))
+                    batch_index = html.escape(str(log.get("batch_index", "-")))
+                    operator = html.escape(str(log.get("operator", "-") or "-"))
+                    reason_text = html.escape(str(log.get("reason", "-") or "-"))
+                    file_name = html.escape(str(log.get("file_name", "-") or "-"))
+                    reprint_items.append(
+                        f"<div style='padding:6px 0; border-top:1px dashed #FDBA74; line-height:1.55;'>"
+                        f"<div style='color:#9A3412; font-weight:800;'>[{created_at}] 第{batch_index}盘重新打印｜{operator}｜{reason_text}</div>"
+                        f"<div style='color:#6B7280; font-size:13px; word-break:break-all;'>文件：{file_name}</div>"
+                        f"</div>"
+                    )
+                st.markdown(
+                    "<div style='background:#FFFBEB; border-left:4px solid #F59E0B; padding:8px 10px; "
+                    "line-height:1.55; margin:8px 0 16px 0; overflow-wrap:anywhere;'>"
+                    "<div style='color:#92400E; font-weight:900; margin-bottom:2px;'>单盘重新打印记录</div>"
+                    + "".join(reprint_items)
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
         
             alert_err_key = f"alert_err_{tid}"
             if alert_err_key in st.session_state:
@@ -2212,11 +2370,13 @@ def render_task_card(task, is_printing):
                         help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚪ 状态: 空闲等待中\n\n💡 提示：点击立刻切入上机状态。"
 
                     with grid_cols[idx % 2]:
+                        has_other_running_batch = bool(running_batch_indices) and idx not in running_batch_indices
+                        if has_other_running_batch:
+                            btn_class = f"{btn_class} batch-muted"
                         st.markdown(f"<span class='{btn_class}'></span>", unsafe_allow_html=True)
-                        has_other_running_batch = current_batch_status == "待打印" and any(i != idx for i in running_batch_indices)
                         batch_disabled = is_paused or has_other_running_batch or (current_batch_status == "待打印" and not can("start_machine")) or (current_batch_status == "打印中" and not can("end_machine")) or (current_batch_status == "已完成" and not (can("start_machine") or can("end_machine")))
                         if has_other_running_batch:
-                            help_tip = f"{help_tip}\n\n⚠️ 当前任务已有其他文件正在打印，请先完成当前打印中的文件。"
+                            help_tip = f"{help_tip}\n\n\u26a0\ufe0f \u5f53\u524d\u4efb\u52a1\u5df2\u6709\u6587\u4ef6\u6b63\u5728\u6253\u5370\uff0c\u8bf7\u5148\u5b8c\u6210\u5f53\u524d\u6253\u5370\u4e2d\u7684\u6587\u4ef6\u3002"
                         st.button(
                             btn_text,
                             key=btn_key,
@@ -2227,6 +2387,22 @@ def render_task_card(task, is_printing):
                             on_click=toggle_batch_status,
                             args=(tid, idx, raw_file_name),
                         )
+                        reprint_key = f"reprint_confirm_{tid}_{idx}"
+                        if current_batch_status == "已完成" and st.session_state.get(reprint_key):
+                            err_key = f"reprint_err_{tid}_{idx}"
+                            if st.session_state.get(err_key):
+                                st.error(st.session_state[err_key])
+                            reason = st.text_input("重新打印原因", key=f"reprint_reason_{tid}_{idx}", placeholder="请输入该盘重新打印原因")
+                            c_ok, c_cancel = st.columns(2)
+                            with c_ok:
+                                if st.button("确认重新打印", key=f"reprint_ok_{tid}_{idx}", type="primary", use_container_width=True):
+                                    reset_completed_batch_for_reprint(tid, idx, raw_file_name, reason)
+                                    request_view_refresh()
+                            with c_cancel:
+                                if st.button("取消", key=f"reprint_cancel_{tid}_{idx}", use_container_width=True):
+                                    st.session_state.pop(reprint_key, None)
+                                    st.session_state.pop(err_key, None)
+                                    request_view_refresh()
 
             st.markdown("<div style='margin-top:5px;'></div>", unsafe_allow_html=True)
             record_col, operation_col = st.columns([5, 3])
