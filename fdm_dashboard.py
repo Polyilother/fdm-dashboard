@@ -44,25 +44,62 @@ MAINTAIN_TYPES = ["1个月小保养", "2个月大保养"]
 
 # ==================== 🛠️ 穿透：.3mf压缩包内存级闪读算法（终极精准校准版） ====================
 def parse_gcode_time_fast(file_bytes, filename):
+    def seconds_to_hours(seconds):
+        try:
+            calc_hours = round(float(seconds) / 3600.0, 1)
+            return calc_hours if calc_hours > 0 else 0.6
+        except (TypeError, ValueError):
+            return 0.6
+
+    def parse_text_time(gcode_text):
+        bambu_matches = re.findall(r';\s*total estimated time:\s*(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', gcode_text)
+        if bambu_matches:
+            final_match = bambu_matches[-1]
+            d = int(final_match[0]) if final_match[0] else 0
+            h = int(final_match[1]) if final_match[1] else 0
+            m = int(final_match[2]) if final_match[2] else 0
+            s = int(final_match[3]) if final_match[3] else 0
+            calc_hours = round((d * 24) + h + (m / 60.0) + (s / 3600.0), 1)
+            if calc_hours > 0:
+                return calc_hours
+
+        print_time_match = re.search(r';\s*PRINT\.TIME\s*:\s*([0-9.]+)', gcode_text, re.IGNORECASE)
+        if print_time_match:
+            return seconds_to_hours(print_time_match.group(1))
+
+        cura_match = re.search(r';\s*TIME\s*:\s*([0-9.]+)', gcode_text, re.IGNORECASE)
+        if cura_match:
+            return seconds_to_hours(cura_match.group(1))
+
+        elapsed_matches = re.findall(r';\s*TIME_ELAPSED\s*:\s*([0-9.]+)', gcode_text, re.IGNORECASE)
+        if elapsed_matches:
+            return seconds_to_hours(max(float(value) for value in elapsed_matches))
+
+        return None
+
+    def parse_filename_time(name):
+        name = str(name or "")
+        match = re.search(r'(?=\d+(?:\.\d+)?\s*[hms])(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?', name, re.IGNORECASE)
+        if not match or not any(match.groups()):
+            return None
+        h = float(match.group(1) or 0)
+        m = float(match.group(2) or 0)
+        s = float(match.group(3) or 0)
+        calc_hours = round(h + (m / 60.0) + (s / 3600.0), 1)
+        return calc_hours if calc_hours > 0 else None
+
     try:
         if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
             tail_data = file_bytes[-65536:].decode('utf-8', errors='ignore')
             head_data = file_bytes[:65536].decode('utf-8', errors='ignore')
             combined = head_data + "\n" + tail_data
-            
-            bambu_matches = re.findall(r';\s*total estimated time:\s*(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', combined)
-            if bambu_matches:
-                final_match = bambu_matches[-1]
-                d = int(final_match[0]) if final_match[0] else 0
-                h = int(final_match[1]) if final_match[1] else 0
-                m = int(final_match[2]) if final_match[2] else 0
-                s = int(final_match[3]) if final_match[3] else 0
-                calc_hours = round((d * 24) + h + (m / 60.0) + (s / 3600.0), 1)
-                if calc_hours > 0: return calc_hours
-                
-            cura_match = re.search(r';TIME:\s*(\d+)', combined)
-            if cura_match:
-                return round(int(cura_match.group(1)) / 3600.0, 1)
+
+            parsed_hours = parse_text_time(combined)
+            if parsed_hours:
+                return parsed_hours
+            filename_hours = parse_filename_time(filename)
+            if filename_hours:
+                return filename_hours
             return 0.6
 
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
@@ -74,23 +111,16 @@ def parse_gcode_time_fast(file_bytes, filename):
                     head_part = content_raw[:65536].decode('utf-8', errors='ignore')
                     tail_part = content_raw[-65536:].decode('utf-8', errors='ignore')
                     gcode_text = head_part + "\n" + tail_part
-                    
-                    bambu_matches = re.findall(r';\s*total estimated time:\s*(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', gcode_text)
-                    if bambu_matches:
-                        final_match = bambu_matches[-1]
-                        d = int(final_match[0]) if final_match[0] else 0
-                        h = int(final_match[1]) if final_match[1] else 0
-                        m = int(final_match[2]) if final_match[2] else 0
-                        s = int(final_match[3]) if final_match[3] else 0
-                        calc_hours = round((d * 24) + h + (m / 60.0) + (s / 3600.0), 1)
-                        if calc_hours > 0: return calc_hours
-                    
-                    cura_match = re.search(r';TIME:\s*(\d+)', gcode_text)
-                    if cura_match:
-                        return round(int(cura_match.group(1)) / 3600.0, 1)
+
+                    parsed_hours = parse_text_time(gcode_text)
+                    if parsed_hours:
+                        return parsed_hours
+                    filename_hours = parse_filename_time(filename)
+                    if filename_hours:
+                        return filename_hours
     except Exception as e:
         pass
-    return 0.6  
+    return 0.6
 
 # ==================== 时间格式化工具 ====================
 def get_formatted_time():
@@ -334,10 +364,10 @@ def render_reports_section(all_tasks, expanded=True):
 
                 mapping = {
                     "created_at": "派单时间", "machine_id": "设备编号", "test_task_type": "任务类型",
-                    "engineer": "白班工程师(派单人)", "material": "线材批次", "status": "最终状态", 
-                    "operator": "执行技术员", "end_operator": "下机技术员", "start_time": "实际上机时间", 
+                    "engineer": "白班工程师(派单人)", "material": "线材批次", "status": "最终状态",
+                    "operator": "执行技术员", "end_operator": "下机技术员", "start_time": "实际上机时间",
                         "end_time": "实际下机时间", "special_notes": "注意事项", "exception_log": "异常记录",
-                    "transfer_notes": "班次交接备注" 
+                    "transfer_notes": "班次交接备注"
                 }
                 df_show = df.rename(columns=mapping)
                 cols_to_show = [col for col in mapping.values() if col in df_show.columns]
@@ -364,8 +394,8 @@ def render_reports_section(all_tasks, expanded=True):
                 )
 
                 mapping_log = {
-                    "machine_id": "设备编号", "test_task_type": "维保/维修项目", 
-                    "display_status": "当前状态", "operator": "操作技术员", 
+                    "machine_id": "设备编号", "test_task_type": "维保/维修项目",
+                    "display_status": "当前状态", "operator": "操作技术员",
                     "start_time": "开始时间/登记时间", "end_time": "解除时间/恢复空闲时间",
                     "exception_log": "维护详情(具体做了什么)"
                 }
@@ -479,7 +509,7 @@ def render_reports_section(all_tasks, expanded=True):
                 now_dt = datetime.now()
                 yesterday_dt = now_dt - timedelta(days=1)
                 recent_tasks = []
-                deviation_log_data = [] 
+                deviation_log_data = []
 
                 for t in all_tasks:
                     status_now = t.get("status")
@@ -496,7 +526,7 @@ def render_reports_section(all_tasks, expanded=True):
                             real_total_hours = round((ed_dt - st_dt).seconds / 3600 + (ed_dt - st_dt).days * 24, 1)
                             raw_th = t.get("theory_total_hours")
                             theory_total_hours = float(raw_th) if raw_th is not None else 2.0
-                            deviation = round(real_total_hours - theory_total_hours, 1) 
+                            deviation = round(real_total_hours - theory_total_hours, 1)
 
                             if deviation <= 1.5: rating = "🟢 极速响应流转"
                             elif deviation <= 3.0: rating = "💛 正常多台管控延迟"
@@ -505,7 +535,7 @@ def render_reports_section(all_tasks, expanded=True):
 
                             deviation_log_data.append({
                                 "设备编号": t.get("machine_id"), "样品牌号": t.get("material"), "总盘数": t.get("total_batches"),
-                                "切片理论总时(h)": theory_total_hours if raw_th is not None else "无", 
+                                "切片理论总时(h)": theory_total_hours if raw_th is not None else "无",
                                 "设备真实占时(h)": real_total_hours, "流转偏差时间(h)": deviation if raw_th is not None else "无法计算",
                                 "精益效率评级": rating, "实际上机时间": st_str, "实际下机时间": ed_str, "执行技术员": t.get("operator")
                             })
@@ -1176,7 +1206,7 @@ def on_exception_submit(tid):
     val = st.session_state.get(f"ex_{tid}")
     if val:
         update_task_field_log(tid, "exception_log", val, "异常记录")
-        st.session_state[f"ex_{tid}"] = "" 
+        st.session_state[f"ex_{tid}"] = ""
 
 def on_transfer_notes_submit(tid):
     val = st.session_state.get(f"note_{tid}")
@@ -1362,7 +1392,7 @@ with st.sidebar:
     if app_page == "电子看板":
         render_admin_data_tools()
         st.divider()
-    
+
         expiry_messages = check_maintenance_expiry(all_tasks)
         if expiry_messages:
             st.markdown("### ⏰ 维保超期警报")
@@ -1371,8 +1401,11 @@ with st.sidebar:
 
         if "form_version" not in st.session_state:
             st.session_state["form_version"] = 0
+        if "upload_version" not in st.session_state:
+            st.session_state["upload_version"] = 0
         v = st.session_state["form_version"]
-    
+        upload_v = st.session_state["upload_version"]
+
         if can("dispatch_task"):
             with st.expander("📝 测试工程师任务下发", expanded=False):
                 with st.container(border=True):
@@ -1380,7 +1413,7 @@ with st.sidebar:
                     st.text_input("测试工程师 *", value=login_engineer, disabled=True, key=f"eng_login_{v}")
                     sel_task_type = st.selectbox("测试任务类型 *", options=TASK_TYPES, key=f"type_select_{v}")
                     custom_task_type = st.text_input("✍️ 自定义任务类型 *", key=f"cust_type_{v}") if sel_task_type == "其他" else ""
-            
+
                     machine_id = st.text_input("设备编号 *", placeholder="请输入机台号", key=f"form_mc_id_{v}")
                     machine_id_clean = normalize_machine_id(machine_id)
                     is_bound_machine = "#" in machine_id_clean
@@ -1401,12 +1434,12 @@ with st.sidebar:
                     elif machine_id_clean and not is_bound_machine:
                         st.caption("未输入 # 的设备编号将按不指定/占坑任务处理，后续可在任务卡片中绑定具体设备。")
                     material = st.text_input("样品牌号 *", key=f"form_mat_{v}")
-            
+
                     uploaded_gcodes = st.file_uploader(
-                        "📂 拖入该任务的所有 Gcode 文件 *", 
-                        type=["gcode", "3mf"], 
+                        "📂 拖入该任务的所有 Gcode 文件 *",
+                        type=["gcode", "3mf"],
                         accept_multiple_files=True,
-                        key=f"gcode_uploader_sidebar_{v}" 
+                        key=f"gcode_uploader_sidebar_{v}_{upload_v}"
                     )
                     preview_total_hours = 0.0
                     if uploaded_gcodes:
@@ -1418,17 +1451,20 @@ with st.sidebar:
                             preview_rows.append(f"{gfile.name}: {file_hours} 小时")
                             gfile.seek(0)
                         st.info(f"⏱️ 切片预览总耗时：{round(preview_total_hours, 1)} 小时 ｜ 共 {len(uploaded_gcodes)} 盘")
+                        if st.button("🧹 一键清除上传文件", use_container_width=True, key=f"clear_uploaded_gcodes_{v}_{upload_v}"):
+                            st.session_state["upload_version"] += 1
+                            request_view_refresh()
                         with st.expander("查看各文件预估耗时", expanded=False):
                             for row in preview_rows:
                                 st.caption(row)
-            
+
                     pending_special_notes = st.text_area("待上机注意事项", key=f"form_pending_notes_{v}")
                     printing_special_notes = st.text_area("打印中注意事项", key=f"form_printing_notes_{v}")
-            
+
                     if st.button("🚀 发送任务", use_container_width=True, type="primary", key=f"submit_btn_{v}", disabled=bool(occupied_task)):
                         final_eng = login_engineer
                         final_type = custom_task_type.strip() if sel_task_type == "其他" else sel_task_type
-                
+
                         if occupied_task:
                             st.error(f"设备 {machine_id_clean} 当前不属于空闲状态，不能绑定下发。")
                         elif not final_eng or not final_type or not material.strip() or not machine_id_clean or not uploaded_gcodes:
@@ -1436,27 +1472,27 @@ with st.sidebar:
                         else:
                             computed_batches = len(uploaded_gcodes)
                             accumulated_hours = 0.0
-                            gcode_names = []  
-                    
+                            gcode_names = []
+
                             for gfile in uploaded_gcodes:
-                                gcode_names.append(gfile.name)  
+                                gcode_names.append(gfile.name)
                                 bytes_data = gfile.read()
                                 file_hours = parse_gcode_time_fast(bytes_data, gfile.name)
                                 accumulated_hours += file_hours
-                    
+
                             final_total_hours = round(accumulated_hours, 1)
                             current_time = get_formatted_time()
-                    
+
                             all_tasks.append({
                                 "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-                                "engineer": final_eng, 
-                                "test_task_type": final_type, 
+                                "engineer": final_eng,
+                                "test_task_type": final_type,
                                 "machine_id": machine_id_clean,
-                                "material": material.strip(), 
+                                "material": material.strip(),
                                 "total_batches": computed_batches,
-                                "gcode_names": gcode_names,  
-                                "theory_total_hours": final_total_hours, 
-                                "finished_batch_timestamps": [], 
+                                "gcode_names": gcode_names,
+                                "theory_total_hours": final_total_hours,
+                                "finished_batch_timestamps": [],
                                 "batch_statuses": ["待打印"] * computed_batches,
                                 "batch_start_times": ["-"] * computed_batches,
                                 "batch_end_times": ["-"] * computed_batches,
@@ -1471,7 +1507,7 @@ with st.sidebar:
                             })
                             log_operation("下发任务", all_tasks[-1], f"任务类型:{final_type}; 样品牌号:{material.strip()}; 盘数:{computed_batches}", final_eng)
                             save_tasks(all_tasks)
-                    
+
                             st.session_state["form_version"] += 1
                             request_view_refresh()
         if not can("dispatch_task"):
@@ -1498,7 +1534,7 @@ with st.sidebar:
                     if m_status == "正常空闲" and current_special_status:
                         st.caption(f"当前设备状态：{current_special_status}")
                     m_detail = st.text_input("维护详情 *", placeholder="具体维护内容", key="m_detail_speed").strip() if need_restore_detail else ""
-        
+
                     if st.button("💾 确认变更状态", use_container_width=True, key="btn_speed_status"):
                         if m_id and m_op:
                             if need_restore_detail and not m_detail:
@@ -1506,15 +1542,15 @@ with st.sidebar:
                                 st.stop()
                             for t in all_tasks:
                                 if normalize_machine_id(t.get('machine_id')) == m_id and t.get('status') in SPECIAL_STATUSES and m_status == "正常空闲":
-                                    t['status'] = f"已完成-{t['status']}" 
+                                    t['status'] = f"已完成-{t['status']}"
                                     t['end_time'] = get_formatted_time()
-                                    if m_detail: t['exception_log'] = m_detail  
+                                    if m_detail: t['exception_log'] = m_detail
                             if m_status != "正常空闲":
                                 all_tasks = [t for t in all_tasks if not (normalize_machine_id(t.get('machine_id')) == m_id and t.get('status') in SPECIAL_STATUSES)]
                                 log_type_display = f"{m_status}({m_sub_type})" if m_status == "设备维保" else m_status
                                 all_tasks.append({
-                                    "id": datetime.now().strftime("%Y%m%d%H%M%S%f"), "engineer": m_op, "test_task_type": log_type_display, 
-                                    "machine_id": m_id, "material": log_type_display, "total_batches": 1, "finished_batch_timestamps": [], 
+                                    "id": datetime.now().strftime("%Y%m%d%H%M%S%f"), "engineer": m_op, "test_task_type": log_type_display,
+                                    "machine_id": m_id, "material": log_type_display, "total_batches": 1, "finished_batch_timestamps": [],
                                     "batch_statuses": ["已完成"], "batch_start_times": [get_formatted_time()], "batch_end_times": [get_formatted_time()],
                                     "status": m_status, "start_time": get_formatted_time(), "end_time": "-", "operator": m_op, "end_operator": "-",
                                     "special_notes": "快速锁定状态", "exception_log": "-", "transfer_notes": "-", "created_at": get_formatted_time()
@@ -1526,7 +1562,7 @@ with st.sidebar:
         if not can("edit_device_status"):
             st.info("当前账号无设备状态修改权限。")
         st.divider()
-    
+
         if is_admin_user(current_user()):
             with st.popover("🚨 清除所有记录", use_container_width=True):
                 pwd = st.text_input("管理员密码", type="password")
@@ -1716,6 +1752,39 @@ st.markdown("""
         min-height: 40px !important;
         line-height: 1.2 !important;
         font-size: 16px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.assign-device-popover-marker) {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+    }
+    span.assign-device-popover-marker {
+        display: block !important;
+        height: 0 !important;
+        line-height: 0 !important;
+        visibility: hidden !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.assign-device-popover-marker) + div[data-testid="stElementContainer"] button {
+        min-height: 42px !important;
+        height: 42px !important;
+        padding-top: 6px !important;
+        padding-bottom: 6px !important;
+        margin-top: 0 !important;
+        transform: translateY(-2px) !important;
+        font-size: 16px !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+    }
+    .record-action-label {
+        height: 28px !important;
+        line-height: 28px !important;
+        margin: 0 0 4px 0 !important;
+        padding: 0 !important;
+        font-size: 16px !important;
+        font-weight: 500 !important;
+        color: #1F2937 !important;
     }
     span.batch-done + div button,
     div[data-testid="stElementContainer"]:has(> div span.batch-done) + div[data-testid="stElementContainer"] button {
@@ -2056,9 +2125,9 @@ with st.expander(f"🗒️ {get_today_key()} 日志", expanded=False):
                 st.markdown(f"""
                 <div style="border-left:4px solid #EF4444; background:#FEF2F2; padding:8px 10px; margin-bottom:6px; border-radius:4px;">
                     <div style="font-size:12px; color:#374151;">
-                        <b>设备:</b> {task.get('machine_id', '-')} ｜ 
-                        <b>测试牌号:</b> {task.get('material', '-')} ｜ 
-                        <b>测试工程师:</b> {task.get('engineer', '-')} ｜ 
+                        <b>设备:</b> {task.get('machine_id', '-')} ｜
+                        <b>测试牌号:</b> {task.get('material', '-')} ｜
+                        <b>测试工程师:</b> {task.get('engineer', '-')} ｜
                         <b>状态:</b> {task.get('status', '-')}
                     </div>
                     <div style="font-size:14px; font-weight:800; color:#991B1B; margin-top:3px;">{note}</div>
@@ -2165,15 +2234,15 @@ if not search_query:
                     cols = st.columns(6)
                 for idx, t in enumerate(row_tasks):
                     status_now = t.get("status")
-                
+
                     if "batch_statuses" in t:
                         count = len([s for s in t["batch_statuses"] if s == "已完成"])
                     else:
                         count = len(t.get("finished_batch_timestamps", []))
-                    
+
                     total = t.get("total_batches", 1)
                     progress = min(count / max(total, 1), 1.0)
-                
+
                     with cols[idx]:
                         if t.get("is_paused", False):
                             bg_color, border_color, text_color = "#F3F4F6", "#6B7280", "#111827"
@@ -2186,11 +2255,11 @@ if not search_query:
                             </div>
                             """, unsafe_allow_html=True)
                         elif status_now in SPECIAL_STATUSES:
-                            if status_now == "故障维修": bg_color, border_color, text_color = "#FEE2E2", "#FCA5A5", "#991B1B" 
-                            elif status_now == "设备维保": bg_color, border_color, text_color = "#DBEAFE", "#93C5FD", "#1E40AF" 
-                            elif status_now == "长周期测试": bg_color, border_color, text_color = "#F3E8FF", "#C084FC", "#6B21A8" 
-                            elif status_now == "材料前期测试": bg_color, border_color, text_color = "#CCFBF1", "#5EEAD4", "#115E59" 
-                            else: bg_color, border_color, text_color = "#FFFBEB", "#FCD34D", "#92400E" 
+                            if status_now == "故障维修": bg_color, border_color, text_color = "#FEE2E2", "#FCA5A5", "#991B1B"
+                            elif status_now == "设备维保": bg_color, border_color, text_color = "#DBEAFE", "#93C5FD", "#1E40AF"
+                            elif status_now == "长周期测试": bg_color, border_color, text_color = "#F3E8FF", "#C084FC", "#6B21A8"
+                            elif status_now == "材料前期测试": bg_color, border_color, text_color = "#CCFBF1", "#5EEAD4", "#115E59"
+                            else: bg_color, border_color, text_color = "#FFFBEB", "#FCD34D", "#92400E"
                             st.markdown(f"""
                             <div style="border: 1px solid {border_color}; padding: 6px; border-radius: 6px; background: {bg_color}; font-size: 11px; margin-bottom: 5px;">
                                 <div style="font-weight: 900; font-size: 18px; color: {text_color}; border-bottom: 1px solid {border_color}; margin-bottom: 4px; padding-bottom: 2px;">设备: {t.get('machine_id')}</div>
@@ -2229,21 +2298,22 @@ if search_query:
 col1, col2 = st.columns(2, vertical_alignment="top")
 
 def render_task_card(task, is_printing):
-    global all_tasks 
+    global all_tasks
     border = "#10B981" if is_printing else "#3B82F6"
     tid = task['id']
 
     with st.container(border=True):
         curr_mc = normalize_machine_id(task.get('machine_id', '待定'))
         is_occupied_anywhere = any(normalize_machine_id(t.get('machine_id')) == curr_mc and t.get("status") in (["打印中"] + SPECIAL_STATUSES) for t in all_tasks)
-    
+
         is_unbound_mc = "#" not in curr_mc
-    
+
         if not is_printing and is_unbound_mc and can("edit_device_status"):
             title_col, edit_col = st.columns([5, 3])
             with title_col:
                 st.markdown(f"### 设备编号: {curr_mc}")
             with edit_col:
+                st.markdown("<span class='assign-device-popover-marker'></span>", unsafe_allow_html=True)
                 with st.popover("🔧 指定具体设备", use_container_width=True):
                     new_mc = normalize_machine_id(st.text_input("请输入确定的机台号:", value="", placeholder="例如: 5#", key=f"inp_mc_{tid}"))
                     if st.button("💾 确认绑定", key=f"btn_mc_{tid}", type="primary", use_container_width=True):
@@ -2259,18 +2329,18 @@ def render_task_card(task, is_printing):
                                 request_view_refresh()
         else:
             st.markdown(f"### 设备编号: {curr_mc}")
-        
+
         st.write(f"测试工程师: {task.get('engineer')} | 任务类型: **{task.get('test_task_type')}**")
         st.write(f"样品牌号: {task.get('material')} | 📦 文件总盘数: **{task.get('total_batches')} 盘**")
-    
+
         theory_hours = task.get('theory_total_hours')
         if theory_hours is None:
             st.markdown("⏱️ 切片理论总耗时: <span style='color:#6B7280; font-weight:bold;'>无 (历史老任务)</span>", unsafe_allow_html=True)
         else:
             st.markdown(f"⏱️ 切片理论总耗时: <span style='color:#1E40AF; font-weight:bold;'>{theory_hours} 小时</span>", unsafe_allow_html=True)
-    
+
         clean_notes = get_task_attention_note(task)
-    
+
         if is_printing:
             st.markdown(f"🏁 实际上机时间: {task.get('start_time')}")
             st.markdown(f"🔮 <span style='font-size:16px; color:#7C3AED; font-weight:bold;'>预计下机时间: {task.get('eta_time', '-')}</span>", unsafe_allow_html=True)
@@ -2280,25 +2350,25 @@ def render_task_card(task, is_printing):
                     f"<div style='background:#FFF7ED; border:1px solid #FDBA74; color:#9A3412; padding:8px; border-radius:4px; font-weight:700;'>⏸️ 当前任务已暂停 ｜ {task.get('pause_start_time', '-')} ｜ 原因：{task.get('pause_reason', '-')}</div>",
                     unsafe_allow_html=True,
                 )
-        
+
             if not clean_notes or clean_notes in ["无", "-", "空白"]:
                 st.markdown(f"📝 打印中注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
             else:
                 st.markdown(f"📝 打印中注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
-        
+
             task.setdefault("batch_statuses", ["待打印"] * task["total_batches"])
             task.setdefault("batch_start_times", ["-"] * task["total_batches"])
             task.setdefault("batch_end_times", ["-"] * task["total_batches"])
-        
+
             count = len([s for s in task["batch_statuses"] if s == "已完成"])
             total = task.get("total_batches", 1)
             running_batch_indices = [i for i, s in enumerate(task["batch_statuses"]) if s == "打印中"]
             st.progress(min(count / max(total, 1), 1.0))
-        
+
             ex_log = task.get("exception_log", "-")
             if ex_log and ex_log != "-":
                 st.markdown(f"**已记录异常:** <span style='color:#D97706; font-weight:bold;'>{ex_log}</span>", unsafe_allow_html=True)
-            
+
             tr_notes = task.get("transfer_notes", "-")
             if tr_notes and tr_notes != "-":
                 st.markdown(f"**班次交接记录:** <span style='color:#2563EB; font-weight:bold;'>{tr_notes}</span>", unsafe_allow_html=True)
@@ -2326,11 +2396,11 @@ def render_task_card(task, is_printing):
                     + "</div>",
                     unsafe_allow_html=True,
                 )
-        
+
             alert_err_key = f"alert_err_{tid}"
             if alert_err_key in st.session_state:
                 st.error(st.session_state[alert_err_key])
-        
+
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             gcode_list = task.get("gcode_names", [])
             st.markdown("<span style='font-size:12px; font-weight:bold; color:#4B5563;'>📋 各盘任务流转清单 (点选转换状态):</span>", unsafe_allow_html=True)
@@ -2343,13 +2413,13 @@ def render_task_card(task, is_printing):
                         raw_file_name = gcode_list[idx]
                     else:
                         raw_file_name = f"未命名测试样件_{idx+1} (历史老任务)"
-                
+
                     clean_name = re.sub(r'(\.gcode)?\.3mf$', '', raw_file_name)
                     clean_name = re.sub(r'\.gcode$', '', clean_name)
                     short_name = clean_name if len(clean_name) <= 15 else f"{clean_name[:10]}..."
-                
+
                     current_batch_status = task["batch_statuses"][idx]
-                
+
                     if current_batch_status == "已完成":
                         btn_text = f"✅ {short_name}"
                         btn_type = "secondary"
@@ -2358,13 +2428,13 @@ def render_task_card(task, is_printing):
                         help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n🟢 上机: {task['batch_start_times'][idx]}\n🏁 完工: {task['batch_end_times'][idx]}\n\n💡 提示：单点此键可将其复位重打。"
                     elif current_batch_status == "打印中":
                         btn_text = f"▶️ {short_name} (打印中)"
-                        btn_type = "primary"  
+                        btn_type = "primary"
                         btn_key = f"run_id_{tid}_{idx}"
                         btn_class = "batch-running"
                         help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚡ 启动时间: {task['batch_start_times'][idx]}\n\n💡 提示：再次点击确认该盘打印结束。"
                     else:
                         btn_text = f"⏳ {short_name}"
-                        btn_type = "secondary"  
+                        btn_type = "secondary"
                         btn_key = f"wait_id_{tid}_{idx}"
                         btn_class = "batch-wait"
                         help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚪ 状态: 空闲等待中\n\n💡 提示：点击立刻切入上机状态。"
@@ -2405,50 +2475,21 @@ def render_task_card(task, is_printing):
                                     request_view_refresh()
 
             st.markdown("<div style='margin-top:5px;'></div>", unsafe_allow_html=True)
-            record_col, operation_col = st.columns([5, 3])
-            with record_col:
-                with st.container(border=True):
+            with st.container(border=True):
+                title_col, action_title_col = st.columns([5, 3])
+                with title_col:
                     st.markdown("<span style='font-size:13px; font-weight:800; color:#374151;'>现场记录</span>", unsafe_allow_html=True)
-                    st.text_input("异常记录", key=f"ex_{tid}", placeholder="输入异常内容后按回车保存", on_change=on_exception_submit, args=(tid,))
-                    st.text_input("班次交接记录", key=f"note_{tid}", placeholder="输入交接信息后按回车保存", on_change=on_transfer_notes_submit, args=(tid,))
-            
-                    if count >= total:
-                        st.markdown("<div style='background-color:#ECFDF5; padding:8px; border-radius:4px; border:1px solid #A7F3D0; font-weight:bold; color:#065F46; text-align:center; margin: 8px 0;'>🎉 全盘打印完毕，请确认技术员流转下机</div>", unsafe_allow_html=True)
-                        end_op = current_user()["username"]
-                        st.text_input("负责下机技术员", value=end_op, disabled=True, key=f"end_op_{tid}")
-                        if st.button("🏁 确认完工下机", key=f"btn_end_{tid}", type="primary", use_container_width=True, disabled=not can("end_machine")):
-                            now_str = get_formatted_time()
-                            eta_str = task.get('eta_time', '-')
-                            try:
-                                n_p = now_str.split(" ")
-                                e_p = eta_str.split(" ")
-                                now_dt = datetime.strptime(f"{n_p[0]} {n_p[2]}", "%Y-%m-%d %H:%M")
-                                eta_dt = datetime.strptime(f"{e_p[0]} {e_p[2]}", "%Y-%m-%d %H:%M")
-                            
-                                if now_dt < eta_dt:
-                                    st.session_state[alert_err_key] = f"❌ 拦截：当前时间早于预计下机时间！任务尚未真正完工。若发生断料或故障请走右侧 [❌ 提前结束] 流程登记下机原因！"
-                                else:
-                                    if alert_err_key in st.session_state: del st.session_state[alert_err_key]
-                                    for t in all_tasks:
-                                        if t['id'] == tid:
-                                            t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
-                                            log_operation("确认下机", t, f"下机技术员:{end_op}")
-                                            update_single_task(t)
-                                    request_view_refresh()
-                            except:
-                                if alert_err_key in st.session_state: del st.session_state[alert_err_key]
-                                for t in all_tasks:
-                                    if t['id'] == tid:
-                                        t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
-                                        log_operation("确认下机", t, f"下机技术员:{end_op}")
-                                        update_single_task(t)
-                                request_view_refresh()
-
-            with operation_col:
-                abort_key = f"abort_{tid}"
-                with st.container(border=True):
+                with action_title_col:
                     st.markdown("<span style='font-size:13px; font-weight:800; color:#374151;'>操作按钮</span>", unsafe_allow_html=True)
-                    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+                abort_key = f"abort_{tid}"
+                label_row_1, _ = st.columns([5, 3])
+                with label_row_1:
+                    st.markdown("<div class='record-action-label'>异常记录</div>", unsafe_allow_html=True)
+                record_control_1, action_control_1 = st.columns([5, 3])
+                with record_control_1:
+                    st.text_input("异常记录", key=f"ex_{tid}", placeholder="输入异常内容后按回车保存", on_change=on_exception_submit, args=(tid,), label_visibility="collapsed")
+                with action_control_1:
                     if st.session_state.get(abort_key, False):
                         abort_reason = st.text_input("下机原因 *", key=f"reason_input_{tid}", placeholder="请输入提前结束的具体原因").strip()
                         c_y, c_n = st.columns(2)
@@ -2464,14 +2505,20 @@ def render_task_card(task, is_printing):
                                             update_single_task(t)
                                     st.session_state[abort_key] = False; request_view_refresh()
                         with c_n:
-                            if st.button("❌ 取消", key=f"an_{tid}", use_container_width=True): 
+                            if st.button("❌ 取消", key=f"an_{tid}", use_container_width=True):
                                 st.session_state[abort_key] = False; request_view_refresh()
                     else:
-                        if st.button("❌ 提前结束任务", key=f"init_a_{tid}", use_container_width=True, disabled=not can("end_machine")): 
+                        if st.button("❌ 提前结束任务", key=f"init_a_{tid}", use_container_width=True, disabled=not can("end_machine")):
                             if alert_err_key in st.session_state: del st.session_state[alert_err_key]
                             st.session_state[abort_key] = True; request_view_refresh()
 
-                    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+                label_row_2, _ = st.columns([5, 3])
+                with label_row_2:
+                    st.markdown("<div class='record-action-label'>班次交接记录</div>", unsafe_allow_html=True)
+                record_control_2, action_control_2 = st.columns([5, 3])
+                with record_control_2:
+                    st.text_input("班次交接记录", key=f"note_{tid}", placeholder="输入交接信息后按回车保存", on_change=on_transfer_notes_submit, args=(tid,), label_visibility="collapsed")
+                with action_control_2:
                     pause_key = f"pause_{tid}"
                     resume_key = f"resume_{tid}"
                     if task.get("is_paused", False):
@@ -2516,22 +2563,53 @@ def render_task_card(task, is_printing):
                         if st.button("⏸️ 暂停此项任务", key=f"init_p_{tid}", use_container_width=True, disabled=not can("end_machine")):
                             st.session_state[pause_key] = True
                             request_view_refresh()
-                    st.markdown("<div style='height:22px;'></div>", unsafe_allow_html=True)
-                      
+
+                if count >= total:
+                    st.markdown("<div style='background-color:#ECFDF5; padding:8px; border-radius:4px; border:1px solid #A7F3D0; font-weight:bold; color:#065F46; text-align:center; margin: 8px 0;'>🎉 全盘打印完毕，请确认技术员流转下机</div>", unsafe_allow_html=True)
+                    end_op = current_user()["username"]
+                    st.text_input("负责下机技术员", value=end_op, disabled=True, key=f"end_op_{tid}")
+                    if st.button("🏁 确认完工下机", key=f"btn_end_{tid}", type="primary", use_container_width=True, disabled=not can("end_machine")):
+                        now_str = get_formatted_time()
+                        eta_str = task.get('eta_time', '-')
+                        try:
+                            n_p = now_str.split(" ")
+                            e_p = eta_str.split(" ")
+                            now_dt = datetime.strptime(f"{n_p[0]} {n_p[2]}", "%Y-%m-%d %H:%M")
+                            eta_dt = datetime.strptime(f"{e_p[0]} {e_p[2]}", "%Y-%m-%d %H:%M")
+
+                            if now_dt < eta_dt:
+                                st.session_state[alert_err_key] = f"❌ 拦截：当前时间早于预计下机时间！任务尚未真正完工。若发生断料或故障请走右侧 [❌ 提前结束] 流程登记下机原因！"
+                            else:
+                                if alert_err_key in st.session_state: del st.session_state[alert_err_key]
+                                for t in all_tasks:
+                                    if t['id'] == tid:
+                                        t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
+                                        log_operation("确认下机", t, f"下机技术员:{end_op}")
+                                        update_single_task(t)
+                                request_view_refresh()
+                        except:
+                            if alert_err_key in st.session_state: del st.session_state[alert_err_key]
+                            for t in all_tasks:
+                                if t['id'] == tid:
+                                    t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
+                                    log_operation("确认下机", t, f"下机技术员:{end_op}")
+                                    update_single_task(t)
+                            request_view_refresh()
+
         else:
             if not clean_notes or clean_notes in ["无", "-", "空白"]:
                 st.markdown(f"📝 待上机注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
             else:
                 st.markdown(f"📝 待上机注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
-            
+
             st.write(f"派单时间: {task.get('created_at', '-')}")
             op_name = current_user()["username"]
             st.text_input("负责技术员", value=op_name, disabled=True, key=f"op_{tid}")
             bc1, bc2 = st.columns([5, 2])
             with bc1:
-                if is_unbound_mc: 
+                if is_unbound_mc:
                     st.button("▶️ 请先指定具体设备", use_container_width=True, disabled=True, key=f"btn_lockout_{tid}", help="该测试任务目前为占坑/模糊状态，请先在上方修改并绑定确切的设备编号！")
-                elif is_occupied_anywhere: 
+                elif is_occupied_anywhere:
                     st.button("⚠️ 设备占/突中", use_container_width=True, disabled=True, key=f"btn_busy_{tid}")
                 else:
                     if st.button("▶️ 确认上机", key=f"btn_start_{tid}", type="primary", use_container_width=True, disabled=not can("start_machine")):
@@ -2544,7 +2622,7 @@ def render_task_card(task, is_printing):
                                 t.update({"status": "打印中", "operator": op_name, "start_time": start_time_now, "eta_time": eta_calculated})
                                 log_operation("任务上机", t, f"负责技术员:{op_name}")
                                 update_single_task(t)
-                        request_view_refresh() 
+                        request_view_refresh()
             with bc2:
                 del_key = f"del_{tid}"
                 if st.session_state.get(del_key, False):
