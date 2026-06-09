@@ -1397,6 +1397,7 @@ def reset_completed_batch_for_reprint(tid, idx, raw_file_name, reason):
 
 
 def toggle_batch_status(tid, idx, raw_file_name):
+    st.session_state[f"batch_expander_open_{tid}"] = True
     with get_conn() as conn:
         row = conn.execute("SELECT data FROM tasks WHERE id = ? FOR UPDATE", (str(tid),)).fetchone()
         if not row:
@@ -2513,7 +2514,8 @@ def render_task_card(task, is_printing):
 
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             gcode_list = task.get("gcode_names", [])
-            with st.expander(f"📋 各盘任务流转清单：{count}/{total} 盘（点击展开）", expanded=False):
+            batch_expander_open = bool(st.session_state.get(f"batch_expander_open_{tid}", False))
+            with st.expander(f"📋 各盘任务流转清单：{count}/{total} 盘", expanded=batch_expander_open):
                 st.markdown("<span style='font-size:12px; font-weight:bold; color:#4B5563;'>点选单盘按钮转换状态</span>", unsafe_allow_html=True)
                 gcode_area_col, _ = st.columns([5, 3])
                 with gcode_area_col:
