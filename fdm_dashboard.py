@@ -29,7 +29,15 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(APP_DIR, "fdm_tasks.db")
 LEGACY_JSON_FILE = os.path.join(APP_DIR, "fdm_tasks.json")
 BACKUP_DIR = os.path.join(APP_DIR, "backups")
+INTERNAL_WARNING_LOG = os.path.join(APP_DIR, "internal_warnings.log")
 st.set_page_config(layout="wide", page_title="FDM打印室任务看板", page_icon="🖨️")
+
+def log_internal_warning(context, detail=""):
+    try:
+        with open(INTERNAL_WARNING_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{get_formatted_time()}] {context}: {detail}\n")
+    except Exception:
+        pass
 
 # ==================== 刷新策略 ====================
 # PostgreSQL 版多人使用时，5 秒全页自动刷新会造成页面发白闪烁。
@@ -119,7 +127,7 @@ def parse_gcode_time_fast(file_bytes, filename):
                     if filename_hours:
                         return filename_hours
     except Exception as e:
-        pass
+        log_internal_warning("Gcode切片耗时识别失败", f"文件:{filename}; 错误:{e}")
     return 0.6
 
 # ==================== 时间格式化工具 ====================
@@ -168,7 +176,8 @@ def get_pg_password():
     if os.path.exists(password_file):
         try:
             return open(password_file, "r", encoding="utf-8").read().strip()
-        except Exception:
+        except Exception as exc:
+            log_internal_warning("PostgreSQL密码文件读取失败", f"文件:{password_file}; 错误:{exc}")
             return ""
     return ""
 
@@ -362,6 +371,21 @@ def render_reports_section(all_tasks, expanded=True):
 
                 df['各盘精密时间链'] = df.apply(format_batch_details, axis=1)
 
+                def format_reprint_details(row):
+                    logs = list_batch_reprint_logs_for_task(row.get("id"), limit=50)
+                    if not logs:
+                        return "-"
+                    details = []
+                    for log in reversed(logs):
+                        details.append(
+                            f"[{log.get('created_at', '-')}] 第{log.get('batch_index', '-')}盘重新打印"
+                            f"｜{log.get('operator', '-') or '-'}｜{log.get('reason', '-') or '-'}"
+                            f"｜文件:{log.get('file_name', '-') or '-'}"
+                        )
+                    return " ｜ ".join(details)
+
+                df['单盘重新打印记录'] = df.apply(format_reprint_details, axis=1)
+
                 mapping = {
                     "created_at": "派单时间", "machine_id": "设备编号", "test_task_type": "任务类型",
                     "engineer": "白班工程师(派单人)", "material": "线材批次", "status": "最终状态",
@@ -371,7 +395,7 @@ def render_reports_section(all_tasks, expanded=True):
                 }
                 df_show = df.rename(columns=mapping)
                 cols_to_show = [col for col in mapping.values() if col in df_show.columns]
-                st.dataframe(df_show[cols_to_show + ["各盘精密时间链"]], use_container_width=True)
+                st.dataframe(df_show[cols_to_show + ["各盘精密时间链", "单盘重新打印记录"]], use_container_width=True)
 
             st.markdown("<br/>", unsafe_allow_html=True)
 
@@ -407,7 +431,38 @@ def render_reports_section(all_tasks, expanded=True):
                     by=["start_time", "machine_sort_no"],
                     ascending=[False, True],
                 )
-                maint_tab, repair_tab = st.tabs([f"设备维保 ({len(maintain_df)})", f"故障维修 ({len(repair_df)})"])
+                single_machine_rows = []
+                for _, row in df_log.iterrows():
+                    kind = row.get("maintenance_kind", "-")
+                    detail = str(row.get("exception_log") or "-").strip()
+                    if not detail or detail == "-":
+                        detail = "暂无维护详情"
+                    start_time = str(row.get("start_time") or "-")
+                    end_time = str(row.get("end_time") or "-")
+                    record_time = end_time if end_time and end_time != "-" else start_time
+                    content_prefix = "设备保养时间" if kind == "设备维保" else "故障维修处理/更换内容"
+                    content = f"{content_prefix}：{record_time}；{detail}" if kind == "设备维保" else f"{content_prefix}：{detail}"
+                    single_machine_rows.append({
+                        "machine_sort_no": row.get("machine_sort_no", 999999),
+                        "log_sort_time": record_time,
+                        "设备编号": row.get("machine_id", "-"),
+                        "日志类型": kind,
+                        "记录时间": record_time,
+                        "维保/维修项目": row.get("test_task_type", "-"),
+                        "记录内容": content,
+                        "操作技术员": row.get("operator", "-"),
+                        "当前状态": row.get("display_status", "-"),
+                    })
+                single_machine_df = pd.DataFrame(single_machine_rows).sort_values(
+                    by=["machine_sort_no", "log_sort_time"],
+                    ascending=[True, False],
+                )
+
+                maint_tab, repair_tab, single_tab = st.tabs([
+                    f"设备维保 ({len(maintain_df)})",
+                    f"故障维修 ({len(repair_df)})",
+                    f"单机日志 ({len(single_machine_df)})",
+                ])
                 with maint_tab:
                     if maintain_df.empty:
                         st.caption("暂无设备维保记录。")
@@ -422,6 +477,15 @@ def render_reports_section(all_tasks, expanded=True):
                         df_log_show = repair_df.rename(columns=mapping_log)
                         cols_log_to_show = [col for col in mapping_log.values() if col in df_log_show.columns]
                         st.dataframe(df_log_show[cols_log_to_show], use_container_width=True, hide_index=True)
+                with single_tab:
+                    if single_machine_df.empty:
+                        st.caption("暂无单机日志。")
+                    else:
+                        st.dataframe(
+                            single_machine_df[["设备编号", "日志类型", "记录时间", "维保/维修项目", "记录内容", "操作技术员", "当前状态"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
             st.markdown("<hr style='border: 1px dashed #DDD; margin: 25px 0;'/>", unsafe_allow_html=True)
 
@@ -458,7 +522,11 @@ def render_reports_section(all_tasks, expanded=True):
                             device_timeline.setdefault(mc, []).append({
                                 "task": t, "start_dt": st_dt, "end_dt": ed_dt, "start_str": st_str_raw, "end_str": ed_str_raw
                             })
-                        except: pass
+                        except Exception as exc:
+                            log_internal_warning(
+                                "设备流转效率时间解析失败",
+                                f"任务:{t.get('id', '-')}; 设备:{mc}; 上机:{st_str_raw}; 下机:{ed_str_raw}; 错误:{exc}",
+                            )
 
                     for mc, logs in device_timeline.items():
                         logs.sort(key=lambda x: x["start_dt"])
@@ -475,7 +543,11 @@ def render_reports_section(all_tasks, expanded=True):
                                 try:
                                     diff_seconds = (current_log["start_dt"] - prev_log["end_dt"]).total_seconds()
                                     idle_hours = round(max(diff_seconds, 0.0) / 3600.0, 1)
-                                except: pass
+                                except Exception as exc:
+                                    log_internal_warning(
+                                        "设备闲置盲区计算失败",
+                                        f"设备:{mc}; 上一单:{last_end_str}; 当前:{current_log.get('start_str', '-')}; 错误:{exc}",
+                                    )
 
                             try:
                                 run_seconds = (current_log["end_dt"] - current_log["start_dt"]).total_seconds()
@@ -504,14 +576,27 @@ def render_reports_section(all_tasks, expanded=True):
             st.markdown("<hr style='border: 1px dashed #DDD; margin: 25px 0;'/>", unsafe_allow_html=True)
 
             if can("report_efficiency"):
-                st.markdown("### 🤖 测试效率智能诊断与切片偏差分析")
+                st.markdown("### 🤖 测试占机时长与切片偏差分析")
 
                 now_dt = datetime.now()
                 yesterday_dt = now_dt - timedelta(days=1)
                 recent_tasks = []
                 deviation_log_data = []
 
+                def is_test_efficiency_task(t):
+                    status = str(t.get("status", ""))
+                    task_type = str(t.get("test_task_type", ""))
+                    material = str(t.get("material", ""))
+                    if status in SPECIAL_STATUSES or any(status == f"已完成-{s}" for s in SPECIAL_STATUSES):
+                        return False
+                    if task_type in SPECIAL_STATUSES or material in SPECIAL_STATUSES:
+                        return False
+                    return True
+
                 for t in all_tasks:
+                    if not is_test_efficiency_task(t):
+                        continue
+
                     status_now = t.get("status")
                     st_str = t.get("start_time", "-")
                     ed_str = t.get("end_time", "-")
@@ -528,8 +613,8 @@ def render_reports_section(all_tasks, expanded=True):
                             theory_total_hours = float(raw_th) if raw_th is not None else 2.0
                             deviation = round(real_total_hours - theory_total_hours, 1)
 
-                            if deviation <= 1.5: rating = "🟢 极速响应流转"
-                            elif deviation <= 3.0: rating = "💛 正常多台管控延迟"
+                            if deviation <= 2.5: rating = "🟢 极速响应流转"
+                            elif deviation <= 3.5: rating = "💛 正常多台管控延迟"
                             else: rating = "🔴 严重闲置/超期卡顿"
                             if status_now == "异常中止": rating = "❌ 测试异常中止"
 
@@ -541,16 +626,24 @@ def render_reports_section(all_tasks, expanded=True):
                             })
                             if st_dt >= yesterday_dt:
                                 recent_tasks.append({"deviation": deviation if raw_th is not None else 0, "status": status_now})
-                        except: pass
+                        except Exception as exc:
+                            log_internal_warning(
+                                "测试占机时长与切片偏差解析失败",
+                                f"任务:{t.get('id', '-')}; 设备:{t.get('machine_id', '-')}; 上机:{st_str}; 下机:{ed_str}; 错误:{exc}",
+                            )
 
                 total_recent = len(recent_tasks)
                 aborted_recent = len([t for t in recent_tasks if t["status"] == "异常中止"])
-                high_delay_cnt = len([t for t in recent_tasks if t["deviation"] > 3.0])
+                high_delay_cnt = len([t for t in recent_tasks if t["deviation"] > 3.5])
+                active_test_cnt = len([
+                    t for t in all_tasks
+                    if is_test_efficiency_task(t) and t.get("status") in ["待上机", "打印中"]
+                ])
 
                 metric_c1, metric_c2, metric_c3 = st.columns(3)
                 with metric_c1: st.metric("近24H 生产测试中止率", f"{(aborted_recent/max(total_recent,1))*100:.1f}%")
                 with metric_c2: st.metric("下机流转闲置严重机台", f"{high_delay_cnt} 单")
-                with metric_c3: st.metric("当前故障/维保锁定机台", f"{len([t for t in all_tasks if t.get('status') in ['故障维修', '设备维保']])} 台")
+                with metric_c3: st.metric("当前测试占机/待上机", f"{active_test_cnt} 单")
 
                 st.markdown("<br/>", unsafe_allow_html=True)
                 if deviation_log_data:
@@ -558,9 +651,9 @@ def render_reports_section(all_tasks, expanded=True):
                     st.dataframe(pd.DataFrame(deviation_log_data), use_container_width=True)
 
                 ai_prompt_text = f"""你是一个资深的 FDM 3D 打印车间精益管理大模型专家。请根据以下我提供的实验室今日“真实总耗时”与“切片预估总时间”的流转数据，输出 150 字内的【设备流转效率与闲置盲区分析日报】：
-        1. 数据总览：近24小时共完成/流转测试任务 {total_recent} 项，出现下机严重闲置超期（理论偏差超过3小时）的任务有 {high_delay_cnt} 笔，异常中止 {aborted_recent} 批。
-        2. 硬件锁定：当前车间因故障维修、设备维保等锁定不可用的设备共有 {len([t for t in all_tasks if t.get('status') in ['故障维修', '设备维保']])} 台。
-        请评估今日车间设备流转效率与盲区周转是否达标，并为工程师和白/夜班技术员分别提供一条减少设备“印完空等”的现场管理动作建议。"""
+        1. 数据总览：近24小时共完成/流转测试任务 {total_recent} 项，出现下机严重闲置超期（理论偏差超过3.5小时）的任务有 {high_delay_cnt} 笔，异常中止 {aborted_recent} 批。
+        2. 测试占用：当前测试相关待上机/打印中任务共有 {active_test_cnt} 单，已排除设备维保、故障维修、外部借用、材料前期测试、长周期测试等非测试状态。
+        请评估今日车间测试占机时长与切片偏差是否达标，并为工程师和白/夜班技术员分别提供一条减少设备“印完空等”的现场管理动作建议。"""
 
                 with st.popover("🤖 一键生成今日 AI 生产效率诊断报告 Prompt", use_container_width=True):
                     st.info("💡 复制下方自动打包好的生产流转数据，直接发给任何大语言模型，即可获得精炼的生产效率日报推送！")
@@ -691,8 +784,8 @@ def run_pg_dump_backup(backup_file):
         if os.path.exists(backup_file):
             try:
                 os.remove(backup_file)
-            except OSError:
-                pass
+            except OSError as exc:
+                log_internal_warning("失败备份文件清理失败", f"文件:{backup_file}; 错误:{exc}")
         return False, (result.stderr or result.stdout or "pg_dump 备份失败").strip()
     return True, ""
 
@@ -829,8 +922,8 @@ def load_tasks():
             task = normalize_task(json.loads(row["data"]))
             if not task.get("deleted", False):
                 tasks.append(task)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_internal_warning("任务JSON读取失败", f"原始数据:{str(row.get('data', ''))[:200]}; 错误:{exc}")
     return tasks
 
 def save_tasks(tasks):
@@ -1035,7 +1128,8 @@ def user_permissions(user):
         return set(PERMISSIONS.keys())
     try:
         return set(json.loads(user["permissions"] or "[]"))
-    except Exception:
+    except Exception as exc:
+        log_internal_warning("用户权限解析失败", f"用户:{user.get('username', '-') if user else '-'}; 错误:{exc}")
         return set()
 
 def can(permission):
@@ -1354,7 +1448,11 @@ def check_maintenance_expiry(tasks):
             device_logs.setdefault(mc, {})
             if m_type not in device_logs[mc] or end_dt > device_logs[mc][m_type]:
                 device_logs[mc][m_type] = end_dt
-        except: pass
+        except Exception as exc:
+            log_internal_warning(
+                "维保超期日期解析失败",
+                f"设备:{mc}; 维保类型:{m_type}; 结束时间:{r.get('end_time', '-')}; 错误:{exc}",
+            )
     now_dt = datetime.now()
     for mc, types in device_logs.items():
         for m_type, last_dt in types.items():
@@ -1442,15 +1540,26 @@ with st.sidebar:
                         key=f"gcode_uploader_sidebar_{v}_{upload_v}"
                     )
                     preview_total_hours = 0.0
+                    gcode_repeat_counts = []
                     if uploaded_gcodes:
                         preview_rows = []
-                        for gfile in uploaded_gcodes:
+                        for idx, gfile in enumerate(uploaded_gcodes):
+                            repeat_count = int(st.number_input(
+                                f"重复打印盘数：{gfile.name}",
+                                min_value=1,
+                                max_value=200,
+                                value=1,
+                                step=1,
+                                key=f"repeat_gcode_{v}_{upload_v}_{idx}",
+                            ))
+                            gcode_repeat_counts.append(repeat_count)
                             bytes_data = gfile.read()
                             file_hours = parse_gcode_time_fast(bytes_data, gfile.name)
-                            preview_total_hours += file_hours
-                            preview_rows.append(f"{gfile.name}: {file_hours} 小时")
+                            preview_total_hours += file_hours * repeat_count
+                            preview_rows.append(f"{gfile.name}: {file_hours} 小时 × {repeat_count} 盘")
                             gfile.seek(0)
-                        st.info(f"⏱️ 切片预览总耗时：{round(preview_total_hours, 1)} 小时 ｜ 共 {len(uploaded_gcodes)} 盘")
+                        preview_total_batches = sum(gcode_repeat_counts)
+                        st.info(f"⏱️ 切片预览总耗时：{round(preview_total_hours, 1)} 小时 ｜ 共 {preview_total_batches} 盘")
                         if st.button("🧹 一键清除上传文件", use_container_width=True, key=f"clear_uploaded_gcodes_{v}_{upload_v}"):
                             st.session_state["upload_version"] += 1
                             request_view_refresh()
@@ -1470,15 +1579,21 @@ with st.sidebar:
                         elif not final_eng or not final_type or not material.strip() or not machine_id_clean or not uploaded_gcodes:
                             st.error("⚠️ 请完整填写信息并上传对应的 Gcode 文件！")
                         else:
-                            computed_batches = len(uploaded_gcodes)
+                            computed_batches = sum(gcode_repeat_counts) if gcode_repeat_counts else len(uploaded_gcodes)
                             accumulated_hours = 0.0
                             gcode_names = []
 
-                            for gfile in uploaded_gcodes:
-                                gcode_names.append(gfile.name)
+                            for idx, gfile in enumerate(uploaded_gcodes):
+                                repeat_count = gcode_repeat_counts[idx] if idx < len(gcode_repeat_counts) else 1
                                 bytes_data = gfile.read()
                                 file_hours = parse_gcode_time_fast(bytes_data, gfile.name)
-                                accumulated_hours += file_hours
+                                accumulated_hours += file_hours * repeat_count
+                                if repeat_count == 1:
+                                    gcode_names.append(gfile.name)
+                                else:
+                                    file_path = Path(gfile.name)
+                                    for repeat_idx in range(1, repeat_count + 1):
+                                        gcode_names.append(f"{file_path.stem}_第{repeat_idx}盘{file_path.suffix}")
 
                             final_total_hours = round(accumulated_hours, 1)
                             current_time = get_formatted_time()
@@ -2383,17 +2498,12 @@ def render_task_card(task, is_printing):
                     reason_text = html.escape(str(log.get("reason", "-") or "-"))
                     file_name = html.escape(str(log.get("file_name", "-") or "-"))
                     reprint_items.append(
-                        f"<div style='padding:6px 0; border-top:1px dashed #FDBA74; line-height:1.55;'>"
-                        f"<div style='color:#9A3412; font-weight:800;'>[{created_at}] 第{batch_index}盘重新打印｜{operator}｜{reason_text}</div>"
-                        f"<div style='color:#6B7280; font-size:13px; word-break:break-all;'>文件：{file_name}</div>"
-                        f"</div>"
+                        f"<span style='color:#D97706; font-weight:bold;'>[{created_at}] 第{batch_index}盘重新打印｜{operator}｜{reason_text}</span>"
+                        f"<span style='color:#6B7280; font-size:13px;'>（文件：{file_name}）</span>"
                     )
                 st.markdown(
-                    "<div style='background:#FFFBEB; border-left:4px solid #F59E0B; padding:8px 10px; "
-                    "line-height:1.55; margin:8px 0 16px 0; overflow-wrap:anywhere;'>"
-                    "<div style='color:#92400E; font-weight:900; margin-bottom:2px;'>单盘重新打印记录</div>"
-                    + "".join(reprint_items)
-                    + "</div>",
+                    "**单盘重新打印记录:** "
+                    + "<br/>".join(reprint_items),
                     unsafe_allow_html=True,
                 )
 
@@ -2403,76 +2513,76 @@ def render_task_card(task, is_printing):
 
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             gcode_list = task.get("gcode_names", [])
-            st.markdown("<span style='font-size:12px; font-weight:bold; color:#4B5563;'>📋 各盘任务流转清单 (点选转换状态):</span>", unsafe_allow_html=True)
+            with st.expander(f"📋 各盘任务流转清单：{count}/{total} 盘（点击展开）", expanded=False):
+                st.markdown("<span style='font-size:12px; font-weight:bold; color:#4B5563;'>点选单盘按钮转换状态</span>", unsafe_allow_html=True)
+                gcode_area_col, _ = st.columns([5, 3])
+                with gcode_area_col:
+                    grid_cols = st.columns(2)
+                    for idx in range(total):
+                        if idx < len(gcode_list):
+                            raw_file_name = gcode_list[idx]
+                        else:
+                            raw_file_name = f"未命名测试样件_{idx+1} (历史老任务)"
 
-            gcode_area_col, _ = st.columns([5, 3])
-            with gcode_area_col:
-                grid_cols = st.columns(2)
-                for idx in range(total):
-                    if idx < len(gcode_list):
-                        raw_file_name = gcode_list[idx]
-                    else:
-                        raw_file_name = f"未命名测试样件_{idx+1} (历史老任务)"
+                        clean_name = re.sub(r'(\.gcode)?\.3mf$', '', raw_file_name)
+                        clean_name = re.sub(r'\.gcode$', '', clean_name)
+                        short_name = clean_name if len(clean_name) <= 15 else f"{clean_name[:10]}..."
 
-                    clean_name = re.sub(r'(\.gcode)?\.3mf$', '', raw_file_name)
-                    clean_name = re.sub(r'\.gcode$', '', clean_name)
-                    short_name = clean_name if len(clean_name) <= 15 else f"{clean_name[:10]}..."
+                        current_batch_status = task["batch_statuses"][idx]
 
-                    current_batch_status = task["batch_statuses"][idx]
+                        if current_batch_status == "已完成":
+                            btn_text = f"✅ {short_name}"
+                            btn_type = "secondary"
+                            btn_key = f"done_id_{tid}_{idx}"
+                            btn_class = "batch-done"
+                            help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n🟢 上机: {task['batch_start_times'][idx]}\n🏁 完工: {task['batch_end_times'][idx]}\n\n💡 提示：单点此键可将其复位重打。"
+                        elif current_batch_status == "打印中":
+                            btn_text = f"▶️ {short_name} (打印中)"
+                            btn_type = "primary"
+                            btn_key = f"run_id_{tid}_{idx}"
+                            btn_class = "batch-running"
+                            help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚡ 启动时间: {task['batch_start_times'][idx]}\n\n💡 提示：再次点击确认该盘打印结束。"
+                        else:
+                            btn_text = f"⏳ {short_name}"
+                            btn_type = "secondary"
+                            btn_key = f"wait_id_{tid}_{idx}"
+                            btn_class = "batch-wait"
+                            help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚪ 状态: 空闲等待中\n\n💡 提示：点击立刻切入上机状态。"
 
-                    if current_batch_status == "已完成":
-                        btn_text = f"✅ {short_name}"
-                        btn_type = "secondary"
-                        btn_key = f"done_id_{tid}_{idx}"
-                        btn_class = "batch-done"
-                        help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n🟢 上机: {task['batch_start_times'][idx]}\n🏁 完工: {task['batch_end_times'][idx]}\n\n💡 提示：单点此键可将其复位重打。"
-                    elif current_batch_status == "打印中":
-                        btn_text = f"▶️ {short_name} (打印中)"
-                        btn_type = "primary"
-                        btn_key = f"run_id_{tid}_{idx}"
-                        btn_class = "batch-running"
-                        help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚡ 启动时间: {task['batch_start_times'][idx]}\n\n💡 提示：再次点击确认该盘打印结束。"
-                    else:
-                        btn_text = f"⏳ {short_name}"
-                        btn_type = "secondary"
-                        btn_key = f"wait_id_{tid}_{idx}"
-                        btn_class = "batch-wait"
-                        help_tip = f"📁 完整文件名:\n{raw_file_name}\n\n⚪ 状态: 空闲等待中\n\n💡 提示：点击立刻切入上机状态。"
-
-                    with grid_cols[idx % 2]:
-                        has_other_running_batch = bool(running_batch_indices) and idx not in running_batch_indices
-                        if has_other_running_batch:
-                            btn_class = f"{btn_class} batch-muted"
-                        st.markdown(f"<span class='{btn_class}'></span>", unsafe_allow_html=True)
-                        batch_disabled = is_paused or has_other_running_batch or (current_batch_status == "待打印" and not can("start_machine")) or (current_batch_status == "打印中" and not can("end_machine")) or (current_batch_status == "已完成" and not (can("start_machine") or can("end_machine")))
-                        if has_other_running_batch:
-                            help_tip = f"{help_tip}\n\n\u26a0\ufe0f \u5f53\u524d\u4efb\u52a1\u5df2\u6709\u6587\u4ef6\u6b63\u5728\u6253\u5370\uff0c\u8bf7\u5148\u5b8c\u6210\u5f53\u524d\u6253\u5370\u4e2d\u7684\u6587\u4ef6\u3002"
-                        st.button(
-                            btn_text,
-                            key=btn_key,
-                            type=btn_type,
-                            use_container_width=True,
-                            help=help_tip,
-                            disabled=batch_disabled,
-                            on_click=toggle_batch_status,
-                            args=(tid, idx, raw_file_name),
-                        )
-                        reprint_key = f"reprint_confirm_{tid}_{idx}"
-                        if current_batch_status == "已完成" and st.session_state.get(reprint_key):
-                            err_key = f"reprint_err_{tid}_{idx}"
-                            if st.session_state.get(err_key):
-                                st.error(st.session_state[err_key])
-                            reason = st.text_input("重新打印原因", key=f"reprint_reason_{tid}_{idx}", placeholder="请输入该盘重新打印原因")
-                            c_ok, c_cancel = st.columns(2)
-                            with c_ok:
-                                if st.button("确认重新打印", key=f"reprint_ok_{tid}_{idx}", type="primary", use_container_width=True):
-                                    reset_completed_batch_for_reprint(tid, idx, raw_file_name, reason)
-                                    request_view_refresh()
-                            with c_cancel:
-                                if st.button("取消", key=f"reprint_cancel_{tid}_{idx}", use_container_width=True):
-                                    st.session_state.pop(reprint_key, None)
-                                    st.session_state.pop(err_key, None)
-                                    request_view_refresh()
+                        with grid_cols[idx % 2]:
+                            has_other_running_batch = bool(running_batch_indices) and idx not in running_batch_indices
+                            if has_other_running_batch:
+                                btn_class = f"{btn_class} batch-muted"
+                            st.markdown(f"<span class='{btn_class}'></span>", unsafe_allow_html=True)
+                            batch_disabled = is_paused or has_other_running_batch or (current_batch_status == "待打印" and not can("start_machine")) or (current_batch_status == "打印中" and not can("end_machine")) or (current_batch_status == "已完成" and not (can("start_machine") or can("end_machine")))
+                            if has_other_running_batch:
+                                help_tip = f"{help_tip}\n\n\u26a0\ufe0f \u5f53\u524d\u4efb\u52a1\u5df2\u6709\u6587\u4ef6\u6b63\u5728\u6253\u5370\uff0c\u8bf7\u5148\u5b8c\u6210\u5f53\u524d\u6253\u5370\u4e2d\u7684\u6587\u4ef6\u3002"
+                            st.button(
+                                btn_text,
+                                key=btn_key,
+                                type=btn_type,
+                                use_container_width=True,
+                                help=help_tip,
+                                disabled=batch_disabled,
+                                on_click=toggle_batch_status,
+                                args=(tid, idx, raw_file_name),
+                            )
+                            reprint_key = f"reprint_confirm_{tid}_{idx}"
+                            if current_batch_status == "已完成" and st.session_state.get(reprint_key):
+                                err_key = f"reprint_err_{tid}_{idx}"
+                                if st.session_state.get(err_key):
+                                    st.error(st.session_state[err_key])
+                                reason = st.text_input("重新打印原因", key=f"reprint_reason_{tid}_{idx}", placeholder="请输入该盘重新打印原因")
+                                c_ok, c_cancel = st.columns(2)
+                                with c_ok:
+                                    if st.button("确认重新打印", key=f"reprint_ok_{tid}_{idx}", type="primary", use_container_width=True):
+                                        reset_completed_batch_for_reprint(tid, idx, raw_file_name, reason)
+                                        request_view_refresh()
+                                with c_cancel:
+                                    if st.button("取消", key=f"reprint_cancel_{tid}_{idx}", use_container_width=True):
+                                        st.session_state.pop(reprint_key, None)
+                                        st.session_state.pop(err_key, None)
+                                        request_view_refresh()
 
             st.markdown("<div style='margin-top:5px;'></div>", unsafe_allow_html=True)
             with st.container(border=True):
