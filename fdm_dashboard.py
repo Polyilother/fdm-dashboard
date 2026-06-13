@@ -1657,6 +1657,25 @@ with st.sidebar:
         st.session_state.pop("_current_user_row", None)
         st.query_params.clear()
         request_view_refresh()
+    with st.expander("🔐 修改密码", expanded=False):
+        old_pwd = st.text_input("当前密码", type="password", key="sidebar_old_password")
+        new_pwd = st.text_input("新密码", type="password", key="sidebar_new_password")
+        confirm_pwd = st.text_input("确认新密码", type="password", key="sidebar_confirm_password")
+        if st.button("确认修改密码", use_container_width=True, key="sidebar_change_password"):
+            if not old_pwd or not new_pwd or not confirm_pwd:
+                st.error("请完整填写当前密码、新密码和确认密码。")
+            elif new_pwd != confirm_pwd:
+                st.error("两次输入的新密码不一致。")
+            elif change_password(auth_user["username"], old_pwd, new_pwd):
+                log_operation("修改密码", detail=f"用户 {auth_user['username']} 修改了自己的密码")
+                delete_login_session(get_session_token_from_url())
+                st.session_state.pop("auth_user", None)
+                st.session_state.pop("_current_user_row", None)
+                st.query_params.clear()
+                st.success("密码已修改，请使用新密码重新登录。")
+                request_view_refresh()
+            else:
+                st.error("当前密码错误。")
     page_options = ["电子看板"]
     if is_admin_user(auth_user):
         page_options.append("后台管理")
