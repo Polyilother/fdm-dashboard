@@ -1855,12 +1855,17 @@ with st.sidebar:
             st.info("当前账号无设备状态修改权限。")
         st.divider()
 
-        if is_admin_user(current_user()):
+        auth_admin = current_user()
+        if is_admin_user(auth_admin):
             with st.popover("🚨 清除所有记录", use_container_width=True):
                 pwd = st.text_input("管理员密码", type="password")
                 if st.button("确认清空"):
-                    if pwd and pwd.lower() == "kexcelled": clear_all_tasks(); log_operation("清空所有记录", detail="管理员清空任务表"); request_view_refresh()
-                    else: st.error("❌ 密码错误")
+                    if pwd and verify_password(pwd, auth_admin["password_hash"]):
+                        clear_all_tasks()
+                        log_operation("清空所有记录", detail=f"管理员 {auth_admin['username']} 清空任务表")
+                        request_view_refresh()
+                    else:
+                        st.error("❌ 密码错误")
 
 # ==================== 看板数据流转逻辑与绝对精确检索 ====================
 st.markdown("""
