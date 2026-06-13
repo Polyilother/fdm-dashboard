@@ -139,6 +139,20 @@ def get_formatted_time():
 def get_short_log_time():
     return datetime.now().strftime("%m.%d %H:%M")
 
+def format_log_time_without_year(value):
+    raw = str(value or "").strip()
+    if not raw or raw == "-":
+        return "-"
+    for fmt in ("%Y-%m-%d 星期一 %H:%M", "%Y-%m-%d 星期二 %H:%M", "%Y-%m-%d 星期三 %H:%M", "%Y-%m-%d 星期四 %H:%M", "%Y-%m-%d 星期五 %H:%M", "%Y-%m-%d 星期六 %H:%M", "%Y-%m-%d 星期日 %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%m.%d %H:%M")
+        except ValueError:
+            pass
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})(?:\s+星期.)?\s+(\d{2}:\d{2})", raw)
+    if match:
+        return f"{match.group(2)}.{match.group(3)} {match.group(4)}"
+    return raw
+
 def normalize_machine_id(value):
     raw = str(value or "").strip()
     if not raw:
@@ -155,10 +169,43 @@ def calculate_eta(start_time_str, total_hours):
         parts = start_time_str.split(" ")
         dt = datetime.strptime(f"{parts[0]} {parts[2]}", "%Y-%m-%d %H:%M")
         eta_dt = dt + timedelta(minutes=int(float(total_hours) * 60))
-        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-        return eta_dt.strftime(f"%Y-%m-%d {weekdays[eta_dt.weekday()]} %H:%M")
+        eta_dt = next_available_checkout_time(eta_dt)
+        return format_dashboard_time(eta_dt)
     except:
         return "-"
+
+def format_dashboard_time(dt):
+    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    return dt.strftime(f"%Y-%m-%d {weekdays[dt.weekday()]} %H:%M")
+
+def is_technician_work_time(dt, rest_days=None):
+    rest_days = rest_days or set()
+    if dt.date().isoformat() in rest_days:
+        return False
+    weekday = dt.weekday()
+    if weekday == 0:
+        return dt.hour >= 8
+    if 1 <= weekday <= 5:
+        return True
+    if weekday == 6:
+        return dt.hour < 8
+    return False
+
+def next_available_checkout_time(dt):
+    rest_days = list_rest_day_values()
+    cursor = dt.replace(second=0, microsecond=0)
+    for _ in range(370):
+        if is_technician_work_time(cursor, rest_days):
+            return cursor
+        if cursor.date().isoformat() in rest_days:
+            cursor = datetime.combine(cursor.date() + timedelta(days=1), datetime.min.time())
+        elif cursor.weekday() == 0 and cursor.hour < 8:
+            cursor = cursor.replace(hour=8, minute=0)
+        elif cursor.weekday() == 6 and cursor.hour >= 8:
+            cursor = datetime.combine(cursor.date() + timedelta(days=1), datetime.min.time()).replace(hour=8)
+        else:
+            cursor = datetime.combine(cursor.date() + timedelta(days=1), datetime.min.time())
+    return cursor
 
 # ==================== PostgreSQL 数据与权限 ====================
 PGHOST = os.getenv("FDM_PGHOST", "localhost")
@@ -313,6 +360,8 @@ def normalize_task(t):
     t.setdefault("test_task_type", "未定义")
     t.setdefault("theory_total_hours", None)
     t.setdefault("eta_time", "-")
+    if t.get("status") == "打印中" and t.get("start_time") != "-" and t.get("theory_total_hours") is not None:
+        t["eta_time"] = calculate_eta(t.get("start_time"), t.get("theory_total_hours"))
     t.setdefault("created_at", get_formatted_time())
     return t
 
@@ -377,21 +426,23 @@ def render_reports_section(all_tasks, expanded=True):
                         return "-"
                     details = []
                     for log in reversed(logs):
+                        log_time = format_log_time_without_year(log.get("created_at", "-"))
                         details.append(
-                            f"[{log.get('created_at', '-')}] 第{log.get('batch_index', '-')}盘重新打印"
+                            f"[{log_time}] 第{log.get('batch_index', '-')}盘重新打印"
                             f"｜{log.get('operator', '-') or '-'}｜{log.get('reason', '-') or '-'}"
                             f"｜文件:{log.get('file_name', '-') or '-'}"
                         )
                     return " ｜ ".join(details)
 
                 df['单盘重新打印记录'] = df.apply(format_reprint_details, axis=1)
+                df["transfer_notes_clean"] = df["transfer_notes"].apply(clean_transfer_notes_for_display)
 
                 mapping = {
                     "created_at": "派单时间", "machine_id": "设备编号", "test_task_type": "任务类型",
                     "engineer": "白班工程师(派单人)", "material": "线材批次", "status": "最终状态",
                     "operator": "执行技术员", "end_operator": "下机技术员", "start_time": "实际上机时间",
-                        "end_time": "实际下机时间", "special_notes": "注意事项", "exception_log": "异常记录",
-                    "transfer_notes": "班次交接备注"
+                    "end_time": "实际下机时间", "special_notes": "注意事项", "exception_log": "异常记录",
+                    "transfer_notes_clean": "班次交接备注"
                 }
                 df_show = df.rename(columns=mapping)
                 cols_to_show = [col for col in mapping.values() if col in df_show.columns]
@@ -711,6 +762,14 @@ def init_database():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_rest_days (
+                rest_date TEXT PRIMARY KEY,
+                note TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS batch_reprint_logs (
                 id SERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -724,7 +783,7 @@ def init_database():
         """)
 
 def get_database_snapshot():
-    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs", "batch_reprint_logs"]
+    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs", "batch_reprint_logs", "calendar_rest_days"]
     order_by_map = {
         "tasks": "created_at, id",
         "users": "id",
@@ -732,6 +791,7 @@ def get_database_snapshot():
         "daily_logs": "id",
         "operation_logs": "id",
         "batch_reprint_logs": "id",
+        "calendar_rest_days": "rest_date",
     }
     snapshot = {
         "created_at": get_formatted_time(),
@@ -1097,6 +1157,42 @@ def delete_user(username):
     with get_conn() as conn:
         conn.execute("DELETE FROM users WHERE username = ? AND is_admin = 0", (username,))
 
+def list_rest_days():
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT rest_date, note, created_by, created_at FROM calendar_rest_days ORDER BY rest_date"
+        ).fetchall()
+
+def list_rest_day_values():
+    try:
+        cache_key = "_rest_day_values_cache"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = {row["rest_date"] for row in list_rest_days()}
+        return st.session_state[cache_key]
+    except Exception as exc:
+        log_internal_warning("读取休息日配置失败", str(exc))
+        return set()
+
+def add_rest_day(rest_date, note="", created_by=""):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO calendar_rest_days (rest_date, note, created_by, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (rest_date) DO UPDATE
+            SET note = EXCLUDED.note,
+                created_by = EXCLUDED.created_by,
+                created_at = EXCLUDED.created_at
+            """,
+            (rest_date, note, created_by, get_formatted_time()),
+        )
+    st.session_state.pop("_rest_day_values_cache", None)
+
+def delete_rest_day(rest_date):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM calendar_rest_days WHERE rest_date = ?", (rest_date,))
+    st.session_state.pop("_rest_day_values_cache", None)
+
 def current_user():
     username = st.session_state.get("auth_user")
     if username:
@@ -1162,7 +1258,7 @@ def render_user_management_panel():
         return
     with st.container(border=True):
         st.markdown("### 👤 用户管理")
-        tab_add, tab_manage, tab_password = st.tabs(["新增用户", "维护账号", "管理员密码"])
+        tab_add, tab_manage, tab_password, tab_calendar = st.tabs(["新增用户", "维护账号", "管理员密码", "休息日配置"])
 
         with tab_add:
             new_username = st.text_input("新用户名", key="panel_new_user_name").strip()
@@ -1236,6 +1332,58 @@ def render_user_management_panel():
                 else:
                     st.error("当前密码错误或新密码为空。")
 
+        with tab_calendar:
+            st.caption("预计下机时间规则：周一 08:00 至周日 08:00 可下机；周日 08:00 至周一 08:00、以及下方配置的休息日不可下机。")
+            rest_date = st.date_input("休息日期", key="panel_rest_date")
+            rest_note = st.text_input("备注", placeholder="例如：国庆休息 / 春节休息 / 转班休息", key="panel_rest_note").strip()
+            if st.button("新增/更新休息日", use_container_width=True, key="panel_add_rest_day"):
+                date_text = rest_date.strftime("%Y-%m-%d")
+                add_rest_day(date_text, rest_note, user["username"])
+                log_operation("维护休息日配置", detail=f"新增/更新休息日:{date_text}; 备注:{rest_note or '-'}")
+                st.success("休息日已保存。")
+                request_view_refresh()
+
+            bulk_days = st.text_area(
+                "批量添加休息日",
+                placeholder="每行一个日期，可带备注，例如：\n2026-10-01 国庆休息\n2026-10-02 国庆休息",
+                key="panel_bulk_rest_days",
+                height=120,
+            )
+            if st.button("批量导入休息日", use_container_width=True, key="panel_bulk_add_rest_days"):
+                imported = 0
+                for line in bulk_days.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\s+(.+))?$", line)
+                    if not match:
+                        continue
+                    add_rest_day(match.group(1), (match.group(2) or "").strip(), user["username"])
+                    imported += 1
+                log_operation("批量导入休息日", detail=f"导入数量:{imported}")
+                st.success(f"已导入 {imported} 个休息日。")
+                request_view_refresh()
+
+            rest_rows = list_rest_days()
+            if rest_rows:
+                rest_df = pd.DataFrame([dict(row) for row in rest_rows]).rename(columns={
+                    "rest_date": "休息日期",
+                    "note": "备注",
+                    "created_by": "维护人",
+                    "created_at": "维护时间",
+                })
+                st.dataframe(rest_df, use_container_width=True, hide_index=True, height=240)
+                delete_options = [f"{row['rest_date']}｜{row['note'] or '-'}" for row in rest_rows]
+                selected_rest = st.selectbox("选择要删除的休息日", delete_options, key="panel_delete_rest_day_select")
+                if st.button("删除选中休息日", use_container_width=True, key="panel_delete_rest_day"):
+                    delete_date = selected_rest.split("｜", 1)[0]
+                    delete_rest_day(delete_date)
+                    log_operation("删除休息日配置", detail=f"删除休息日:{delete_date}")
+                    st.warning("休息日已删除。")
+                    request_view_refresh()
+            else:
+                st.caption("暂无休息日配置。")
+
 def render_admin_data_tools():
     user = current_user()
     if not user or not user["is_admin"]:
@@ -1307,6 +1455,34 @@ def on_transfer_notes_submit(tid):
     if val:
         update_task_field_log(tid, "transfer_notes", val, "班次交接记录")
         st.session_state[f"note_{tid}"] = ""
+
+def toggle_batch_list_expander(expander_key):
+    st.session_state[expander_key] = not bool(st.session_state.get(expander_key, False))
+
+def clean_transfer_notes_for_display(notes):
+    raw = str(notes or "").strip()
+    if not raw or raw == "-":
+        return "-"
+    parts = [part.strip() for part in raw.split("|")]
+    keep_parts = [
+        part for part in parts
+        if "暂停任务" not in part and "恢复任务" not in part and "暂停原因" not in part
+    ]
+    return " | ".join(keep_parts) if keep_parts else "-"
+
+def list_task_operation_logs_for_task(tid, limit=20):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT action, operator, detail, created_at
+            FROM operation_logs
+            WHERE task_id = ?
+              AND action IN ('暂停任务', '恢复任务', '提前结束任务')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (str(tid), int(limit)),
+        ).fetchall()
 
 def update_task_field_log(tid, field, value, action):
     with get_conn() as conn:
@@ -1892,6 +2068,72 @@ st.markdown("""
         font-size: 16px !important;
         font-weight: 700 !important;
         border-radius: 8px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+    }
+    span.batch-list-toggle-marker {
+        display: block !important;
+        height: 0 !important;
+        line-height: 0 !important;
+        visibility: hidden !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) + div[data-testid="stElementContainer"] button {
+        width: 100% !important;
+        height: 42px !important;
+        min-height: 42px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        position: relative !important;
+        padding: 0 48px 0 14px !important;
+        margin: 0 !important;
+        border: 1px solid #D1D5DB !important;
+        border-radius: 8px !important;
+        background: #FFFFFF !important;
+        transition: background-color 180ms ease !important;
+        color: #1F2937 !important;
+        font-size: 16px !important;
+        font-weight: 500 !important;
+        line-height: 1 !important;
+        text-align: left !important;
+        box-shadow: none !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) + div[data-testid="stElementContainer"] button p,
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) + div[data-testid="stElementContainer"] button div[data-testid="stMarkdownContainer"] {
+        width: 100% !important;
+        display: flex !important;
+        justify-content: flex-start !important;
+        text-align: left !important;
+        margin: 0 !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) + div[data-testid="stElementContainer"] button > div {
+        width: 100% !important;
+        justify-content: flex-start !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker) + div[data-testid="stElementContainer"] button::after {
+        content: "›" !important;
+        position: absolute !important;
+        right: 16px !important;
+        top: 50% !important;
+        transform: translateY(-50%) !important;
+        font-size: 22px !important;
+        font-weight: 600 !important;
+        color: #374151 !important;
+        line-height: 1 !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker.batch-list-open) + div[data-testid="stElementContainer"] button {
+        background: #F3F4F6 !important;
+        border-bottom-left-radius: 0 !important;
+        border-bottom-right-radius: 0 !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div span.batch-list-toggle-marker.batch-list-open) + div[data-testid="stElementContainer"] button::after {
+        content: "▾" !important;
+        font-size: 18px !important;
     }
     .record-action-label {
         height: 28px !important;
@@ -2485,15 +2727,28 @@ def render_task_card(task, is_printing):
             if ex_log and ex_log != "-":
                 st.markdown(f"**已记录异常:** <span style='color:#D97706; font-weight:bold;'>{ex_log}</span>", unsafe_allow_html=True)
 
-            tr_notes = task.get("transfer_notes", "-")
+            tr_notes = clean_transfer_notes_for_display(task.get("transfer_notes", "-"))
             if tr_notes and tr_notes != "-":
                 st.markdown(f"**班次交接记录:** <span style='color:#2563EB; font-weight:bold;'>{tr_notes}</span>", unsafe_allow_html=True)
+
+            task_operation_logs = list_task_operation_logs_for_task(tid)
+            if task_operation_logs:
+                operation_items = []
+                for log in reversed(task_operation_logs):
+                    created_at = html.escape(format_log_time_without_year(log.get("created_at", "-")))
+                    action = html.escape(str(log.get("action", "-") or "-"))
+                    operator = html.escape(str(log.get("operator", "-") or "-"))
+                    detail = html.escape(str(log.get("detail", "-") or "-"))
+                    operation_items.append(
+                        f"<span style='color:#4B5563; font-weight:bold;'>[{created_at}] {action}｜{operator}｜{detail}</span>"
+                    )
+                st.markdown("**任务操作记录:** " + "<br/>".join(operation_items), unsafe_allow_html=True)
 
             reprint_logs = list_batch_reprint_logs_for_task(tid)
             if reprint_logs:
                 reprint_items = []
                 for log in reprint_logs:
-                    created_at = html.escape(str(log.get("created_at", "-")))
+                    created_at = html.escape(format_log_time_without_year(log.get("created_at", "-")))
                     batch_index = html.escape(str(log.get("batch_index", "-")))
                     operator = html.escape(str(log.get("operator", "-") or "-"))
                     reason_text = html.escape(str(log.get("reason", "-") or "-"))
@@ -2514,8 +2769,18 @@ def render_task_card(task, is_printing):
 
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             gcode_list = task.get("gcode_names", [])
-            batch_expander_open = bool(st.session_state.get(f"batch_expander_open_{tid}", False))
-            with st.expander(f"📋 各盘任务流转清单：{count}/{total} 盘", expanded=batch_expander_open):
+            batch_expander_key = f"batch_expander_open_{tid}"
+            batch_expander_open = bool(st.session_state.get(batch_expander_key, False))
+            batch_toggle_class = "batch-list-toggle-marker batch-list-open" if batch_expander_open else "batch-list-toggle-marker"
+            st.markdown(f"<span class='{batch_toggle_class}'></span>", unsafe_allow_html=True)
+            st.button(
+                f"📋 各盘任务流转清单：{count}/{total} 盘",
+                key=f"batch_toggle_{tid}",
+                use_container_width=True,
+                on_click=toggle_batch_list_expander,
+                args=(batch_expander_key,),
+            )
+            if batch_expander_open:
                 st.markdown("<span style='font-size:12px; font-weight:bold; color:#4B5563;'>点选单盘按钮转换状态</span>", unsafe_allow_html=True)
                 gcode_area_col, _ = st.columns([5, 3])
                 with gcode_area_col:
@@ -2586,112 +2851,149 @@ def render_task_card(task, is_printing):
                                         st.session_state.pop(err_key, None)
                                         request_view_refresh()
 
-            st.markdown("<div style='margin-top:5px;'></div>", unsafe_allow_html=True)
-            with st.container(border=True):
-                title_col, action_title_col = st.columns([5, 3])
-                with title_col:
-                    st.markdown("<span style='font-size:13px; font-weight:800; color:#374151;'>现场记录</span>", unsafe_allow_html=True)
-                with action_title_col:
-                    st.markdown("<span style='font-size:13px; font-weight:800; color:#374151;'>操作按钮</span>", unsafe_allow_html=True)
+            record_action_key = f"record_action_open_{tid}"
+            record_action_open = bool(st.session_state.get(record_action_key, False))
+            record_action_class = "batch-list-toggle-marker record-action-toggle-marker batch-list-open" if record_action_open else "batch-list-toggle-marker record-action-toggle-marker"
+            st.markdown(f"<span class='{record_action_class}'></span>", unsafe_allow_html=True)
+            st.button(
+                "📝 现场记录 / 操作按钮",
+                key=f"record_action_toggle_{tid}",
+                use_container_width=True,
+                on_click=toggle_batch_list_expander,
+                args=(record_action_key,),
+            )
+            if record_action_open:
+                st.markdown("<div style='margin-top:5px;'></div>", unsafe_allow_html=True)
+                with st.container(border=True):
+                    abort_key = f"abort_{tid}"
+                    label_row_1, _ = st.columns([5, 3])
+                    with label_row_1:
+                        st.markdown("<div class='record-action-label'>异常记录</div>", unsafe_allow_html=True)
+                    record_control_1, action_control_1 = st.columns([5, 3])
+                    with record_control_1:
+                        st.text_input("异常记录", key=f"ex_{tid}", placeholder="输入异常内容后按回车保存", on_change=on_exception_submit, args=(tid,), label_visibility="collapsed")
+                    with action_control_1:
+                        if st.session_state.get(abort_key, False):
+                            abort_reason = st.text_input("下机原因 *", key=f"reason_input_{tid}", placeholder="请输入提前结束的具体原因").strip()
+                            c_y, c_n = st.columns(2)
+                            with c_y:
+                                if st.button("✔️ 确认", key=f"ay_{tid}", type="primary", use_container_width=True):
+                                    if abort_reason:
+                                        if alert_err_key in st.session_state: del st.session_state[alert_err_key]
+                                        for t in all_tasks:
+                                            if t['id'] == tid:
+                                                t['exception_log'] = f"提前下机原因: {abort_reason}"
+                                                t.update({"status": "异常中止", "end_time": get_formatted_time()})
+                                                log_operation("提前结束任务", t, f"原因:{abort_reason}")
+                                                update_single_task(t)
+                                        st.session_state[abort_key] = False; request_view_refresh()
+                            with c_n:
+                                if st.button("❌ 取消", key=f"an_{tid}", use_container_width=True):
+                                    st.session_state[abort_key] = False; request_view_refresh()
+                        else:
+                            if st.button("❌ 提前结束任务", key=f"init_a_{tid}", use_container_width=True, disabled=not can("end_machine")):
+                                if alert_err_key in st.session_state: del st.session_state[alert_err_key]
+                                st.session_state[abort_key] = True; request_view_refresh()
 
-                abort_key = f"abort_{tid}"
-                label_row_1, _ = st.columns([5, 3])
-                with label_row_1:
-                    st.markdown("<div class='record-action-label'>异常记录</div>", unsafe_allow_html=True)
-                record_control_1, action_control_1 = st.columns([5, 3])
-                with record_control_1:
-                    st.text_input("异常记录", key=f"ex_{tid}", placeholder="输入异常内容后按回车保存", on_change=on_exception_submit, args=(tid,), label_visibility="collapsed")
-                with action_control_1:
-                    if st.session_state.get(abort_key, False):
-                        abort_reason = st.text_input("下机原因 *", key=f"reason_input_{tid}", placeholder="请输入提前结束的具体原因").strip()
-                        c_y, c_n = st.columns(2)
-                        with c_y:
-                            if st.button("✔️ 确认", key=f"ay_{tid}", type="primary", use_container_width=True):
-                                if abort_reason:
+                    label_row_2, _ = st.columns([5, 3])
+                    with label_row_2:
+                        st.markdown("<div class='record-action-label'>班次交接记录</div>", unsafe_allow_html=True)
+                    record_control_2, action_control_2 = st.columns([5, 3])
+                    with record_control_2:
+                        st.text_input("班次交接记录", key=f"note_{tid}", placeholder="输入交接信息后按回车保存", on_change=on_transfer_notes_submit, args=(tid,), label_visibility="collapsed")
+                    with action_control_2:
+                        pause_key = f"pause_{tid}"
+                        resume_key = f"resume_{tid}"
+                        if task.get("is_paused", False):
+                            if st.button("▶️ 恢复此项任务", key=resume_key, type="primary", use_container_width=True, disabled=not can("start_machine")):
+                                for t in all_tasks:
+                                    if t["id"] == tid:
+                                        reason = t.get("pause_reason", "-")
+                                        t["is_paused"] = False
+                                        t["pause_reason"] = "-"
+                                        t["pause_start_time"] = "-"
+                                        log_operation("恢复任务", t, f"暂停原因:{reason}")
+                                        update_single_task(t)
+                                request_view_refresh()
+                        elif st.session_state.get(pause_key, False):
+                            pause_reason = st.text_input("暂停原因 *", key=f"pause_reason_{tid}", placeholder="请输入暂停原因").strip()
+                            p_y, p_n = st.columns(2)
+                            with p_y:
+                                if st.button("⏸️ 确认暂停", key=f"py_{tid}", type="primary", use_container_width=True):
+                                    if pause_reason:
+                                        pause_time = get_formatted_time()
+                                        for t in all_tasks:
+                                            if t["id"] == tid:
+                                                t["is_paused"] = True
+                                                t["pause_reason"] = pause_reason
+                                                t["pause_start_time"] = pause_time
+                                                log_operation("暂停任务", t, f"原因:{pause_reason}")
+                                                update_single_task(t)
+                                        st.session_state[pause_key] = False
+                                        request_view_refresh()
+                            with p_n:
+                                if st.button("取消", key=f"pn_{tid}", use_container_width=True):
+                                    st.session_state[pause_key] = False
+                                    request_view_refresh()
+                        else:
+                            if st.button("⏸️ 暂停此项任务", key=f"init_p_{tid}", use_container_width=True, disabled=not can("end_machine")):
+                                st.session_state[pause_key] = True
+                                request_view_refresh()
+
+                    if count >= total:
+                        st.markdown("<div style='background-color:#ECFDF5; padding:8px; border-radius:4px; border:1px solid #A7F3D0; font-weight:bold; color:#065F46; text-align:center; margin: 8px 0;'>🎉 全盘打印完毕，请确认技术员流转下机</div>", unsafe_allow_html=True)
+                        end_op = current_user()["username"]
+                        st.text_input("负责下机技术员", value=end_op, disabled=True, key=f"end_op_{tid}")
+                        early_checkout_key = f"early_checkout_confirm_{tid}"
+                        early_checkout_reason_key = f"early_checkout_reason_{tid}"
+                        if st.session_state.get(early_checkout_key, False):
+                            st.warning("当前时间早于排班预计下机时间。如现场已加班完成或临时安排值守，请填写原因后确认下机。")
+                            early_reason = st.text_input(
+                                "提前/加班下机原因 *",
+                                key=early_checkout_reason_key,
+                                placeholder="例如：周日加班完成 / 临时安排值守 / 实际已完成",
+                            ).strip()
+                            early_ok_col, early_cancel_col = st.columns(2)
+                            with early_ok_col:
+                                if st.button("确认提前/加班下机", key=f"early_checkout_ok_{tid}", type="primary", use_container_width=True):
+                                    if early_reason:
+                                        if alert_err_key in st.session_state: del st.session_state[alert_err_key]
+                                        for t in all_tasks:
+                                            if t['id'] == tid:
+                                                t.update({"status": "已完工", "end_operator": end_op, "end_time": get_formatted_time()})
+                                                log_operation("确认下机", t, f"下机技术员:{end_op}; 提前/加班下机原因:{early_reason}")
+                                                update_single_task(t)
+                                        st.session_state.pop(early_checkout_key, None)
+                                        st.session_state.pop(early_checkout_reason_key, None)
+                                        request_view_refresh()
+                                    else:
+                                        st.error("请填写提前/加班下机原因。")
+                            with early_cancel_col:
+                                if st.button("取消", key=f"early_checkout_cancel_{tid}", use_container_width=True):
+                                    st.session_state.pop(early_checkout_key, None)
+                                    st.session_state.pop(early_checkout_reason_key, None)
+                                    request_view_refresh()
+                        elif st.button("🏁 确认完工下机", key=f"btn_end_{tid}", type="primary", use_container_width=True, disabled=not can("end_machine")):
+                            now_str = get_formatted_time()
+                            eta_str = task.get('eta_time', '-')
+                            try:
+                                n_p = now_str.split(" ")
+                                e_p = eta_str.split(" ")
+                                now_dt = datetime.strptime(f"{n_p[0]} {n_p[2]}", "%Y-%m-%d %H:%M")
+                                eta_dt = datetime.strptime(f"{e_p[0]} {e_p[2]}", "%Y-%m-%d %H:%M")
+
+                                if now_dt < eta_dt:
+                                    st.session_state[early_checkout_key] = True
+                                    request_view_refresh()
+                                else:
                                     if alert_err_key in st.session_state: del st.session_state[alert_err_key]
                                     for t in all_tasks:
                                         if t['id'] == tid:
-                                            t['exception_log'] = f"提前下机原因: {abort_reason}"
-                                            t.update({"status": "异常中止", "end_time": get_formatted_time()})
-                                            log_operation("提前结束任务", t, f"原因:{abort_reason}")
+                                            t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
+                                            log_operation("确认下机", t, f"下机技术员:{end_op}")
                                             update_single_task(t)
-                                    st.session_state[abort_key] = False; request_view_refresh()
-                        with c_n:
-                            if st.button("❌ 取消", key=f"an_{tid}", use_container_width=True):
-                                st.session_state[abort_key] = False; request_view_refresh()
-                    else:
-                        if st.button("❌ 提前结束任务", key=f"init_a_{tid}", use_container_width=True, disabled=not can("end_machine")):
-                            if alert_err_key in st.session_state: del st.session_state[alert_err_key]
-                            st.session_state[abort_key] = True; request_view_refresh()
-
-                label_row_2, _ = st.columns([5, 3])
-                with label_row_2:
-                    st.markdown("<div class='record-action-label'>班次交接记录</div>", unsafe_allow_html=True)
-                record_control_2, action_control_2 = st.columns([5, 3])
-                with record_control_2:
-                    st.text_input("班次交接记录", key=f"note_{tid}", placeholder="输入交接信息后按回车保存", on_change=on_transfer_notes_submit, args=(tid,), label_visibility="collapsed")
-                with action_control_2:
-                    pause_key = f"pause_{tid}"
-                    resume_key = f"resume_{tid}"
-                    if task.get("is_paused", False):
-                        if st.button("▶️ 恢复此项任务", key=resume_key, type="primary", use_container_width=True, disabled=not can("start_machine")):
-                            resume_time = get_formatted_time()
-                            for t in all_tasks:
-                                if t["id"] == tid:
-                                    old = t.get("transfer_notes", "-")
-                                    reason = t.get("pause_reason", "-")
-                                    resume_log = f"[{resume_time}]恢复任务，暂停原因:{reason}"
-                                    t["transfer_notes"] = resume_log if old == "-" else f"{old} | {resume_log}"
-                                    t["is_paused"] = False
-                                    t["pause_reason"] = "-"
-                                    t["pause_start_time"] = "-"
-                                    log_operation("恢复任务", t, f"暂停原因:{reason}")
-                                    update_single_task(t)
-                            request_view_refresh()
-                    elif st.session_state.get(pause_key, False):
-                        pause_reason = st.text_input("暂停原因 *", key=f"pause_reason_{tid}", placeholder="请输入暂停原因").strip()
-                        p_y, p_n = st.columns(2)
-                        with p_y:
-                            if st.button("⏸️ 确认暂停", key=f"py_{tid}", type="primary", use_container_width=True):
-                                if pause_reason:
-                                    pause_time = get_formatted_time()
-                                    for t in all_tasks:
-                                        if t["id"] == tid:
-                                            old = t.get("transfer_notes", "-")
-                                            pause_log = f"[{pause_time}]暂停任务:{pause_reason}"
-                                            t["transfer_notes"] = pause_log if old == "-" else f"{old} | {pause_log}"
-                                            t["is_paused"] = True
-                                            t["pause_reason"] = pause_reason
-                                            t["pause_start_time"] = pause_time
-                                            log_operation("暂停任务", t, f"原因:{pause_reason}")
-                                            update_single_task(t)
-                                    st.session_state[pause_key] = False
                                     request_view_refresh()
-                        with p_n:
-                            if st.button("取消", key=f"pn_{tid}", use_container_width=True):
-                                st.session_state[pause_key] = False
-                                request_view_refresh()
-                    else:
-                        if st.button("⏸️ 暂停此项任务", key=f"init_p_{tid}", use_container_width=True, disabled=not can("end_machine")):
-                            st.session_state[pause_key] = True
-                            request_view_refresh()
-
-                if count >= total:
-                    st.markdown("<div style='background-color:#ECFDF5; padding:8px; border-radius:4px; border:1px solid #A7F3D0; font-weight:bold; color:#065F46; text-align:center; margin: 8px 0;'>🎉 全盘打印完毕，请确认技术员流转下机</div>", unsafe_allow_html=True)
-                    end_op = current_user()["username"]
-                    st.text_input("负责下机技术员", value=end_op, disabled=True, key=f"end_op_{tid}")
-                    if st.button("🏁 确认完工下机", key=f"btn_end_{tid}", type="primary", use_container_width=True, disabled=not can("end_machine")):
-                        now_str = get_formatted_time()
-                        eta_str = task.get('eta_time', '-')
-                        try:
-                            n_p = now_str.split(" ")
-                            e_p = eta_str.split(" ")
-                            now_dt = datetime.strptime(f"{n_p[0]} {n_p[2]}", "%Y-%m-%d %H:%M")
-                            eta_dt = datetime.strptime(f"{e_p[0]} {e_p[2]}", "%Y-%m-%d %H:%M")
-
-                            if now_dt < eta_dt:
-                                st.session_state[alert_err_key] = f"❌ 拦截：当前时间早于预计下机时间！任务尚未真正完工。若发生断料或故障请走右侧 [❌ 提前结束] 流程登记下机原因！"
-                            else:
+                            except:
                                 if alert_err_key in st.session_state: del st.session_state[alert_err_key]
                                 for t in all_tasks:
                                     if t['id'] == tid:
@@ -2699,14 +3001,6 @@ def render_task_card(task, is_printing):
                                         log_operation("确认下机", t, f"下机技术员:{end_op}")
                                         update_single_task(t)
                                 request_view_refresh()
-                        except:
-                            if alert_err_key in st.session_state: del st.session_state[alert_err_key]
-                            for t in all_tasks:
-                                if t['id'] == tid:
-                                    t.update({"status": "已完工", "end_operator": end_op, "end_time": now_str})
-                                    log_operation("确认下机", t, f"下机技术员:{end_op}")
-                                    update_single_task(t)
-                            request_view_refresh()
 
         else:
             if not clean_notes or clean_notes in ["无", "-", "空白"]:
