@@ -31,6 +31,8 @@ backups/
 *.backup
 *.dump
 *.sql
+!migrations/
+!migrations/*.sql
 
 # Logs and temporary files
 logs/

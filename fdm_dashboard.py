@@ -32,6 +32,17 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 INTERNAL_WARNING_LOG = os.path.join(APP_DIR, "internal_warnings.log")
 st.set_page_config(layout="wide", page_title="FDM打印室任务看板", page_icon="🖨️")
 
+def get_float_env(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+ENV_TEMP_LOW = get_float_env("ENV_TEMP_LOW", 20)
+ENV_TEMP_HIGH = get_float_env("ENV_TEMP_HIGH", 26)
+ENV_HUMIDITY_LOW = get_float_env("ENV_HUMIDITY_LOW", 30)
+ENV_HUMIDITY_HIGH = get_float_env("ENV_HUMIDITY_HIGH", 60)
+
 def log_internal_warning(context, detail=""):
     try:
         with open(INTERNAL_WARNING_LOG, "a", encoding="utf-8") as f:
@@ -232,6 +243,7 @@ PGPASSWORD = get_pg_password()
 
 PERMISSIONS = {
     "dispatch_task": "下发任务",
+    "remove_task": "移除任务",
     "edit_device_status": "设备状态修改",
     "start_machine": "上机点击",
     "end_machine": "下机点击",
@@ -435,6 +447,7 @@ def render_reports_section(all_tasks, expanded=True):
                     return " ｜ ".join(details)
 
                 df['单盘重新打印记录'] = df.apply(format_reprint_details, axis=1)
+                df['环境数据'] = df.apply(format_task_env_summary, axis=1)
                 df["transfer_notes_clean"] = df["transfer_notes"].apply(clean_transfer_notes_for_display)
 
                 mapping = {
@@ -446,7 +459,9 @@ def render_reports_section(all_tasks, expanded=True):
                 }
                 df_show = df.rename(columns=mapping)
                 cols_to_show = [col for col in mapping.values() if col in df_show.columns]
-                st.dataframe(df_show[cols_to_show + ["各盘精密时间链", "单盘重新打印记录"]], use_container_width=True)
+                st.dataframe(df_show[cols_to_show + ["各盘精密时间链", "单盘重新打印记录", "环境数据"]], use_container_width=True)
+
+            render_environment_report_section()
 
             st.markdown("<br/>", unsafe_allow_html=True)
 
@@ -781,9 +796,65 @@ def init_database():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS env_devices (
+                id SERIAL PRIMARY KEY,
+                user_device_id TEXT UNIQUE NOT NULL,
+                device_code TEXT,
+                custom_name TEXT,
+                device_status TEXT,
+                use_type TEXT,
+                battery REAL,
+                battery_time TEXT,
+                in_probe_property TEXT,
+                ext_probe_property TEXT,
+                last_sync_at TEXT,
+                record_id TEXT,
+                device_sn TEXT,
+                gateway_sn TEXT,
+                product_model TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS env_device_trips (
+                id SERIAL PRIMARY KEY,
+                user_device_trip_id TEXT UNIQUE NOT NULL,
+                user_device_id TEXT,
+                device_code TEXT,
+                trip_status TEXT,
+                trip_code TEXT,
+                custom_name TEXT,
+                actual_begin_time TEXT,
+                actual_end_time TEXT,
+                collect_interval TEXT,
+                active_time TEXT,
+                created_at TEXT,
+                record_id TEXT,
+                device_sn TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS env_readings (
+                id SERIAL PRIMARY KEY,
+                device_code TEXT NOT NULL,
+                user_device_trip_id TEXT NOT NULL,
+                probe_type INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                temperature REAL,
+                humidity REAL,
+                light REAL,
+                shock REAL,
+                longitude TEXT,
+                latitude TEXT,
+                created_at TEXT,
+                record_id TEXT,
+                device_sn TEXT,
+                UNIQUE(device_code, user_device_trip_id, probe_type, recorded_at)
+            )
+        """)
 
 def get_database_snapshot():
-    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs", "batch_reprint_logs", "calendar_rest_days"]
+    tables = ["tasks", "users", "login_sessions", "daily_logs", "operation_logs", "batch_reprint_logs", "calendar_rest_days", "env_devices", "env_device_trips", "env_readings"]
     order_by_map = {
         "tasks": "created_at, id",
         "users": "id",
@@ -792,6 +863,9 @@ def get_database_snapshot():
         "operation_logs": "id",
         "batch_reprint_logs": "id",
         "calendar_rest_days": "rest_date",
+        "env_devices": "device_code, id",
+        "env_device_trips": "actual_begin_time, id",
+        "env_readings": "recorded_at, id",
     }
     snapshot = {
         "created_at": get_formatted_time(),
@@ -807,6 +881,303 @@ def get_database_snapshot():
 
 def write_database_snapshot(path):
     Path(path).write_text(get_database_snapshot(), encoding="utf-8")
+
+def parse_env_datetime(value):
+    if not value or value == "-":
+        return None
+    text = str(value).strip()
+    if text.replace(".", "", 1).isdigit():
+        try:
+            number = int(float(text))
+            if number > 100000000000:
+                return datetime.fromtimestamp(number / 1000)
+            if number > 1000000000:
+                return datetime.fromtimestamp(number)
+        except (OSError, OverflowError, ValueError):
+            pass
+    text = re.sub(r"\s+星期[一二三四五六日天]\s+", " ", text)
+    text = text.replace("T", " ").replace("Z", "")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(text[: len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+def env_threshold_exceeded(temp_value, humidity_value):
+    temp_bad = temp_value is not None and temp_value >= ENV_TEMP_HIGH
+    humidity_bad = humidity_value is not None and humidity_value > ENV_HUMIDITY_HIGH
+    return temp_bad or humidity_bad
+
+def env_probe_label(probe_type):
+    text = str(probe_type if probe_type is not None else "").strip()
+    return {
+        "0": "内置探头",
+        "1": "外置探头1",
+        "2": "外置探头2",
+    }.get(text, f"探头{text}" if text else "探头")
+
+def list_env_latest_readings():
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    ranked.device_code,
+                    ranked.recorded_at,
+                    ranked.temperature,
+                    ranked.humidity,
+                    ranked.probe_type,
+                    d.custom_name,
+                    d.device_status,
+                    d.battery,
+                    d.last_sync_at
+                FROM (
+                    SELECT
+                        r.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY r.device_code, r.probe_type
+                            ORDER BY r.recorded_at DESC, r.id DESC
+                        ) AS rn
+                    FROM env_readings r
+                ) ranked
+                LEFT JOIN env_devices d ON ranked.device_code = d.device_code
+                WHERE ranked.rn = 1
+                ORDER BY ranked.device_code, ranked.probe_type
+            """).fetchall()
+            data = [dict(row) for row in rows]
+            for row in data:
+                row["probe_label"] = env_probe_label(row.get("probe_type"))
+            return data
+    except Exception as exc:
+        log_internal_warning("环境最新数据读取失败", str(exc))
+        return []
+
+def format_latest_environment_inline():
+    rows = list_env_latest_readings()
+    if not rows:
+        return (
+            "<div class='env-summary'>"
+            "<div class='env-summary-row'>"
+            "<span class='env-summary-label'>温湿度</span>"
+            "<span class='env-summary-muted'>暂无同步数据</span>"
+            "</div></div>"
+        )
+    html_rows = []
+    for row in rows:
+        temp = row.get("temperature")
+        humidity = row.get("humidity")
+        recorded_at = row.get("recorded_at") or "-"
+        sync_at = row.get("last_sync_at") or "-"
+        temp_text = f"{temp:.1f}℃" if isinstance(temp, (int, float)) else "-"
+        humidity_text = f"{humidity:.1f}%RH" if isinstance(humidity, (int, float)) else "-"
+        probe_label = row.get("probe_label", "探头")
+        html_rows.append(
+            "<div class='env-summary-row'>"
+            f"<span class='env-summary-label'>{probe_label}</span>"
+            f"<span class='env-summary-time'>采集 {recorded_at}</span>"
+            f"<span class='env-summary-value'>温度 {temp_text}</span>"
+            f"<span class='env-summary-value'>湿度 {humidity_text}</span>"
+            f"<span class='env-summary-sync'>同步 {sync_at}</span>"
+            "</div>"
+        )
+    return "<div class='env-summary'>" + "".join(html_rows) + "</div>"
+
+def list_env_recent_readings(hours=24):
+    cutoff = datetime.now() - timedelta(hours=hours)
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT device_code, recorded_at, temperature, humidity, probe_type
+                FROM env_readings
+                ORDER BY recorded_at DESC
+                LIMIT 5000
+            """).fetchall()
+        data = []
+        for row in rows:
+            item = dict(row)
+            dt = parse_env_datetime(item.get("recorded_at"))
+            if dt and dt >= cutoff:
+                item["recorded_at_dt"] = dt
+                item["probe_label"] = env_probe_label(item.get("probe_type"))
+                item["series_label"] = f"{item.get('device_code', '-')}-{item['probe_label']}"
+                data.append(item)
+        return list(reversed(data))
+    except Exception as exc:
+        log_internal_warning("环境历史数据读取失败", str(exc))
+        return []
+
+def list_env_alerts(hours=24):
+    alerts = []
+    for row in list_env_latest_readings():
+        temp_value = row.get("temperature")
+        humidity_value = row.get("humidity")
+        if env_threshold_exceeded(temp_value, humidity_value):
+            alert_type = []
+            if temp_value is not None and temp_value >= ENV_TEMP_HIGH:
+                alert_type.append("温度超限")
+            if humidity_value is not None and humidity_value > ENV_HUMIDITY_HIGH:
+                alert_type.append("湿度超限")
+            row["alert_type"] = " / ".join(alert_type)
+            alerts.append(row)
+    return alerts
+
+def get_task_env_summary(task):
+    start_dt = parse_env_datetime(task.get("start_time"))
+    end_dt = parse_env_datetime(task.get("end_time")) or datetime.now()
+    if not start_dt:
+        return None
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT device_code, recorded_at, temperature, humidity
+                FROM env_readings
+                ORDER BY recorded_at DESC
+                LIMIT 10000
+            """).fetchall()
+        readings = []
+        for row in rows:
+            item = dict(row)
+            dt = parse_env_datetime(item.get("recorded_at"))
+            if dt and start_dt <= dt <= end_dt:
+                readings.append(item)
+        if not readings:
+            return None
+        temps = [r.get("temperature") for r in readings if r.get("temperature") is not None]
+        hums = [r.get("humidity") for r in readings if r.get("humidity") is not None]
+        if not temps and not hums:
+            return None
+        exceeded = any(env_threshold_exceeded(r.get("temperature"), r.get("humidity")) for r in readings)
+        return {
+            "count": len(readings),
+            "avg_temp": round(sum(temps) / len(temps), 1) if temps else None,
+            "max_temp": round(max(temps), 1) if temps else None,
+            "min_temp": round(min(temps), 1) if temps else None,
+            "avg_humidity": round(sum(hums) / len(hums), 1) if hums else None,
+            "max_humidity": round(max(hums), 1) if hums else None,
+            "min_humidity": round(min(hums), 1) if hums else None,
+            "exceeded": exceeded,
+        }
+    except Exception as exc:
+        log_internal_warning("任务环境摘要读取失败", f"task={task.get('id')}; {exc}")
+        return None
+
+def format_task_env_summary(task):
+    summary = get_task_env_summary(task)
+    if not summary:
+        return "-"
+    temp_text = f"温度 均{summary['avg_temp']}℃/高{summary['max_temp']}℃/低{summary['min_temp']}℃"
+    humidity_text = f"湿度 均{summary['avg_humidity']}%/高{summary['max_humidity']}%/低{summary['min_humidity']}%"
+    alert_text = "超限" if summary["exceeded"] else "正常"
+    return f"{temp_text}；{humidity_text}；{alert_text}"
+
+def render_task_environment_section(task):
+    summary = get_task_env_summary(task)
+    with st.expander("🌡️ 环境数据", expanded=False):
+        if not summary:
+            st.caption("暂无该任务期间的温湿度记录。")
+            return
+        c1, c2, c3 = st.columns(3)
+        c1.metric("平均温度", f"{summary['avg_temp']} ℃" if summary["avg_temp"] is not None else "-")
+        c2.metric("最高/最低温度", f"{summary['max_temp']} / {summary['min_temp']} ℃" if summary["max_temp"] is not None else "-")
+        c3.metric("记录点数", f"{summary['count']} 条")
+        h1, h2, h3 = st.columns(3)
+        h1.metric("平均湿度", f"{summary['avg_humidity']} %RH" if summary["avg_humidity"] is not None else "-")
+        h2.metric("最高/最低湿度", f"{summary['max_humidity']} / {summary['min_humidity']} %RH" if summary["max_humidity"] is not None else "-")
+        h3.metric("阈值状态", "超限" if summary["exceeded"] else "正常")
+        st.caption(f"阈值：温度 >= {ENV_TEMP_HIGH:g} ℃；湿度 > {ENV_HUMIDITY_HIGH:g} %RH")
+
+def render_environment_monitor_page():
+    st.markdown(
+        "<div class='app-title'><span class='app-title-icon'>🌡️</span><span class='app-title-text'>打印室环境监控</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"<div class='dashboard-time'>当前时间：{get_formatted_time()}</div>", unsafe_allow_html=True)
+    st.caption(f"报警阈值：温度 >= {ENV_TEMP_HIGH:g} ℃；湿度 > {ENV_HUMIDITY_HIGH:g} %RH")
+
+    latest_rows = list_env_latest_readings()
+    if not latest_rows:
+        st.info("暂无环境数据。请先在服务器运行 Freshliance 同步脚本。")
+        return
+
+    latest_df = pd.DataFrame(latest_rows)
+    latest_df["阈值状态"] = latest_df.apply(
+        lambda row: "⚠️ 超限" if env_threshold_exceeded(row.get("temperature"), row.get("humidity")) else "正常",
+        axis=1,
+    )
+    latest_df = latest_df.rename(columns={
+        "device_code": "设备编号",
+        "custom_name": "设备名称",
+        "probe_label": "探头",
+        "temperature": "最新温度(℃)",
+        "humidity": "最新湿度(%RH)",
+        "battery": "电量",
+        "device_status": "在线状态",
+        "recorded_at": "最后采集时间",
+        "last_sync_at": "最后同步时间",
+    })
+    show_cols = [col for col in ["设备编号", "设备名称", "探头", "最新温度(℃)", "最新湿度(%RH)", "电量", "在线状态", "最后采集时间", "最后同步时间", "阈值状态"] if col in latest_df.columns]
+    st.dataframe(latest_df[show_cols], use_container_width=True, hide_index=True)
+
+    recent_rows = list_env_recent_readings(24)
+    if recent_rows:
+        chart_df = pd.DataFrame(recent_rows)
+        chart_df["recorded_at_dt"] = pd.to_datetime(chart_df["recorded_at_dt"])
+        st.markdown("### 最近 24 小时温度曲线")
+        st.line_chart(chart_df.pivot_table(index="recorded_at_dt", columns="series_label", values="temperature", aggfunc="mean"))
+        st.markdown("### 最近 24 小时湿度曲线")
+        st.line_chart(chart_df.pivot_table(index="recorded_at_dt", columns="series_label", values="humidity", aggfunc="mean"))
+
+    alerts = list_env_alerts(24)
+    st.markdown("### 当前温湿度超限记录")
+    if alerts:
+        alert_df = pd.DataFrame(alerts).rename(columns={
+            "device_code": "设备编号",
+            "recorded_at": "采集时间",
+            "probe_label": "探头",
+            "temperature": "温度(℃)",
+            "humidity": "湿度(%RH)",
+            "alert_type": "异常类型",
+        })
+        st.dataframe(alert_df[["设备编号", "探头", "采集时间", "温度(℃)", "湿度(%RH)", "异常类型"]], use_container_width=True, hide_index=True)
+    else:
+        st.success("当前暂无温湿度超限记录。")
+
+def render_environment_report_section():
+    if not (is_admin_user(current_user()) or can("report_efficiency")):
+        return
+    st.markdown("#### 🌡️ 打印室温湿度记录")
+    latest_rows = list_env_latest_readings()
+    if latest_rows:
+        latest_df = pd.DataFrame(latest_rows).rename(columns={
+            "device_code": "设备编号",
+            "custom_name": "设备名称",
+            "probe_label": "探头",
+            "recorded_at": "最新采集时间",
+            "temperature": "最新温度(℃)",
+            "humidity": "最新湿度(%RH)",
+            "battery": "电量",
+            "last_sync_at": "最后同步时间",
+        })
+        latest_cols = [col for col in ["设备编号", "设备名称", "探头", "最新采集时间", "最新温度(℃)", "最新湿度(%RH)", "电量", "最后同步时间"] if col in latest_df.columns]
+        st.dataframe(latest_df[latest_cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无温湿度同步数据。")
+
+    alerts = list_env_alerts(72)
+    if alerts:
+        st.markdown("##### 当前温湿度超限记录")
+        alert_df = pd.DataFrame(alerts).drop(columns=["recorded_at_dt"], errors="ignore").rename(columns={
+            "device_code": "设备编号",
+            "recorded_at": "采集时间",
+            "probe_label": "探头",
+            "temperature": "温度(℃)",
+            "humidity": "湿度(%RH)",
+            "alert_type": "异常类型",
+        })
+        st.dataframe(alert_df[["设备编号", "探头", "采集时间", "温度(℃)", "湿度(%RH)", "异常类型"]], use_container_width=True, hide_index=True)
 
 def find_pg_dump_executable():
     pg_dump = shutil.which("pg_dump")
@@ -1676,7 +2047,7 @@ with st.sidebar:
                 request_view_refresh()
             else:
                 st.error("当前密码错误。")
-    page_options = ["电子看板"]
+    page_options = ["电子看板", "环境监控"]
     if is_admin_user(auth_user):
         page_options.append("后台管理")
     elif any(can(p) for p in ['report_task_flow', 'report_maintenance', 'report_oee', 'report_efficiency']):
@@ -2056,6 +2427,39 @@ st.markdown("""
         margin-top: 0;
         margin-bottom: 0.45rem;
     }
+    .env-summary {
+        display: grid;
+        gap: 4px;
+        margin: 0.1rem 0 0.55rem 0;
+        color: #4B5563;
+        font-size: 15px;
+        font-weight: 600;
+    }
+    .env-summary-row {
+        display: grid;
+        grid-template-columns: 88px 205px 92px 110px 205px;
+        column-gap: 14px;
+        align-items: center;
+        line-height: 1.35;
+        white-space: nowrap;
+    }
+    .env-summary-label {
+        color: #1F2937;
+        font-weight: 800;
+    }
+    .env-summary-value,
+    .env-summary-time,
+    .env-summary-sync,
+    .env-summary-muted {
+        color: #4B5563;
+    }
+    @media (max-width: 1100px) {
+        .env-summary-row {
+            grid-template-columns: 88px 1fr;
+            row-gap: 2px;
+            white-space: normal;
+        }
+    }
     div[data-testid="stHorizontalBlock"] {
         gap: 0.55rem !important;
         align-items: flex-start !important;
@@ -2371,6 +2775,10 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+if app_page == "环境监控":
+    render_environment_monitor_page()
+    st.stop()
+
 if app_page == "后台管理":
     st.markdown(
         "<div class='app-title'><span class='app-title-icon'>🛠️</span><span class='app-title-text'>FDM 后台管理</span></div>",
@@ -2487,6 +2895,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(f"<div class='dashboard-time'>当前时间：{get_formatted_time()}</div>", unsafe_allow_html=True)
+st.markdown(format_latest_environment_inline(), unsafe_allow_html=True)
 
 status_printing_tasks = [t for t in all_tasks if t.get("status") == "打印中"]
 status_special_tasks = [t for t in all_tasks if t.get("status") in SPECIAL_STATUSES]
@@ -2737,6 +3146,8 @@ def render_task_card(task, is_printing):
                 st.markdown(f"📝 打印中注意事项: <span style='color:#1F2937;'>无</span>", unsafe_allow_html=True)
             else:
                 st.markdown(f"📝 打印中注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
+
+            render_task_environment_section(task)
 
             task.setdefault("batch_statuses", ["待打印"] * task["total_batches"])
             task.setdefault("batch_start_times", ["-"] * task["total_batches"])
@@ -3059,7 +3470,7 @@ def render_task_card(task, is_printing):
                     if st.button("✔️", key=f"dy_{tid}", type="primary", use_container_width=True):
                         soft_delete_task(tid); all_tasks = [t for t in all_tasks if t['id'] != tid]; request_view_refresh()
                 else:
-                    if st.button("🗑️ 移除", key=f"init_d_{tid}", use_container_width=True, disabled=not can("dispatch_task")): st.session_state[del_key] = True; request_view_refresh()
+                    if st.button("🗑️ 移除", key=f"init_d_{tid}", use_container_width=True, disabled=not can("remove_task")): st.session_state[del_key] = True; request_view_refresh()
 
 with col1:
     st.markdown(f"<div class='task-section-title'>🖨️ 打印中 ({len(printing_tasks)})</div>", unsafe_allow_html=True)
