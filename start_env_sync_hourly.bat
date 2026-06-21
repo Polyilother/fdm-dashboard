@@ -15,9 +15,9 @@ if not defined FDM_PGPASSWORD (
 )
 
 if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0jobs\sync_freshliance_env.py" --hours 72 --probe-type 0 --max-records 3 --loop --align-hour
+    "%~dp0.venv\Scripts\python.exe" "%~dp0jobs\sync_freshliance_env.py" --hours 3 --probe-type 0 --max-records 1 --loop --align-hour
 ) else (
-    python "%~dp0jobs\sync_freshliance_env.py" --hours 72 --probe-type 0 --max-records 3 --loop --align-hour
+    python "%~dp0jobs\sync_freshliance_env.py" --hours 3 --probe-type 0 --max-records 1 --loop --align-hour
 )
 
 pause

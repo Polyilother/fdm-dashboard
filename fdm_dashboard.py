@@ -3147,8 +3147,6 @@ def render_task_card(task, is_printing):
             else:
                 st.markdown(f"📝 打印中注意事项: <span style='color:#EF4444; font-weight:bold;'>{clean_notes}</span>", unsafe_allow_html=True)
 
-            render_task_environment_section(task)
-
             task.setdefault("batch_statuses", ["待打印"] * task["total_batches"])
             task.setdefault("batch_start_times", ["-"] * task["total_batches"])
             task.setdefault("batch_end_times", ["-"] * task["total_batches"])
