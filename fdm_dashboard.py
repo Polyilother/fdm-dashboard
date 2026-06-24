@@ -965,6 +965,18 @@ def format_latest_environment_inline():
             "<span class='env-summary-muted'>暂无同步数据</span>"
             "</div></div>"
         )
+    # The dashboard header is a room snapshot, not a device inventory.
+    # Keep only the newest reading for each probe type across all devices.
+    latest_by_probe = {}
+    for row in rows:
+        probe_key = row.get("probe_type")
+        row_time = parse_env_datetime(row.get("recorded_at")) or datetime.min
+        current = latest_by_probe.get(probe_key)
+        current_time = parse_env_datetime(current.get("recorded_at")) if current else None
+        if current is None or row_time > (current_time or datetime.min):
+            latest_by_probe[probe_key] = row
+    rows = [latest_by_probe[key] for key in sorted(latest_by_probe, key=lambda value: str(value))]
+
     html_rows = []
     for row in rows:
         temp = row.get("temperature")
@@ -1121,14 +1133,53 @@ def render_environment_monitor_page():
     show_cols = [col for col in ["设备编号", "设备名称", "探头", "最新温度(℃)", "最新湿度(%RH)", "电量", "在线状态", "最后采集时间", "最后同步时间", "阈值状态"] if col in latest_df.columns]
     st.dataframe(latest_df[show_cols], use_container_width=True, hide_index=True)
 
-    recent_rows = list_env_recent_readings(24)
+    recent_rows = list_env_recent_readings(72)
     if recent_rows:
         chart_df = pd.DataFrame(recent_rows)
         chart_df["recorded_at_dt"] = pd.to_datetime(chart_df["recorded_at_dt"])
-        st.markdown("### 最近 24 小时温度曲线")
-        st.line_chart(chart_df.pivot_table(index="recorded_at_dt", columns="series_label", values="temperature", aggfunc="mean"))
-        st.markdown("### 最近 24 小时湿度曲线")
-        st.line_chart(chart_df.pivot_table(index="recorded_at_dt", columns="series_label", values="humidity", aggfunc="mean"))
+        # Devices upload near xx:53 and the service syncs at the next hour.
+        # Show one latest point per probe on that hour boundary.
+        chart_df["sync_hour"] = chart_df["recorded_at_dt"].dt.ceil("h")
+        chart_df = (
+            chart_df.sort_values("recorded_at_dt")
+            .groupby(["sync_hour", "series_label"], as_index=False)
+            .last()
+        )
+        def render_env_hourly_chart(value_column, value_title):
+            chart_data = chart_df.dropna(subset=[value_column])
+            st.vega_lite_chart(
+                chart_data,
+                {
+                    "mark": {"type": "line", "point": {"size": 48}, "strokeWidth": 2},
+                    "encoding": {
+                        "x": {
+                            "field": "sync_hour",
+                            "type": "temporal",
+                            "title": "同步整点",
+                            "axis": {
+                                "format": "%m-%d %H:00",
+                                "labelAngle": 0,
+                                "labelOverlap": "greedy",
+                                "tickCount": 12,
+                            },
+                        },
+                        "y": {"field": value_column, "type": "quantitative", "title": value_title},
+                        "color": {"field": "series_label", "type": "nominal", "title": "探头"},
+                        "tooltip": [
+                            {"field": "sync_hour", "type": "temporal", "title": "同步整点", "format": "%Y-%m-%d %H:%M"},
+                            {"field": "series_label", "type": "nominal", "title": "探头"},
+                            {"field": value_column, "type": "quantitative", "title": value_title, "format": ".1f"},
+                        ],
+                    },
+                    "height": 320,
+                },
+                use_container_width=True,
+            )
+
+        st.markdown("### 最近 3 天温度曲线")
+        render_env_hourly_chart("temperature", "温度 (℃)")
+        st.markdown("### 最近 3 天湿度曲线")
+        render_env_hourly_chart("humidity", "湿度 (%RH)")
 
     alerts = list_env_alerts(24)
     st.markdown("### 当前温湿度超限记录")

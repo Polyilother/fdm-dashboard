@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import sys
 import time
@@ -215,7 +216,9 @@ def fetch_probe_readings_with_retry(record_id, probe_type, begin_ms, end_ms, pag
 def seconds_until_next_hour(now=None):
     now = now or datetime.now()
     next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return max(1, int((next_hour - now).total_seconds()))
+    # Keep the loop on the real hour boundary. int() truncated fractional
+    # seconds and could trigger the next run at xx:59:59.
+    return max(1, math.ceil((next_hour - now).total_seconds()))
 
 
 def get_device_info(device_row):
